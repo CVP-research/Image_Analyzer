@@ -1,178 +1,350 @@
-# editor.py
-import numpy as np
+# composer.py
+import os
+from pathlib import Path
 from PIL import Image
+import numpy as np
+import gradio as gr
+from depth import compute_depth
+from segment import run_segmentation
+from editor import composite_with_depth
+
+BASE_DIR = Path(__file__).resolve().parent
+INPUT_DIR = BASE_DIR / "input"
+OVERLAY_DIR = BASE_DIR / "overlays"
+OVERLAY_DIR.mkdir(exist_ok=True)
+
+# 캐시: 배경 이미지별로 depth 및 segment 저장
+BG_CACHE = {}
 
 
-def composite_with_depth(background_img, background_depth, overlay_img, overlay_depth_value, overlay_position=(0, 0)):
-    """
-    배경 이미지와 누끼 객체를 depth 기반으로 합성
+def get_background_list():
+    """배경 이미지 목록 가져오기"""
+    return sorted([
+        f.name for f in INPUT_DIR.iterdir()
+        if f.suffix.lower() in ['.jpg', '.jpeg', '.png']
+    ])
 
-    Args:
-        background_img: 배경 PIL 이미지 (RGB)
-        background_depth: 배경의 depth map (numpy array, 값이 클수록 가까움)
-        overlay_img: 누끼 객체 PIL 이미지 (RGBA, 투명도 포함)
-        overlay_depth_value: 누끼 객체의 depth 값 (0-1, 클수록 가까움)
-        overlay_position: 누끼 객체의 (x, y) 위치
 
-    Returns:
-        합성된 PIL 이미지 (RGB)
-    """
-    # 배경 이미지를 numpy로 변환 (한 번만)
-    if not isinstance(background_img, np.ndarray):
-        bg_array = np.array(background_img).copy()
+def get_overlay_list():
+    """누끼 이미지 목록 가져오기"""
+    return sorted([
+        f.name for f in OVERLAY_DIR.iterdir()
+        if f.suffix.lower() in ['.png']
+    ])
+
+
+def load_background(bg_name):
+    """배경 이미지 로드 및 depth, segmentation 계산"""
+    if not bg_name:
+        return None, None, None, None
+    
+    bg_path = INPUT_DIR / bg_name
+    
+    if bg_name in BG_CACHE:
+        return BG_CACHE[bg_name]
+    
+    bg_img = Image.open(bg_path).convert("RGB")
+    
+    # Depth 계산
+    depth_vis, depth_raw = compute_depth(bg_img)
+    
+    # Segmentation 계산
+    annotations, json_data = run_segmentation(bg_img)
+    
+    # Segment별 평균 depth 계산 및 depth map 생성
+    h, w = depth_raw.shape
+    segment_depth_map = np.zeros((h, w), dtype=np.float32)
+    
+    # 각 segment의 평균 depth를 계산하고 해당 영역을 평균값으로 채움
+    for mask, label in annotations:
+        if mask.sum() > 0:
+            # 해당 segment 영역의 평균 depth
+            segment_depths = depth_raw[mask]
+            mean_depth = np.mean(segment_depths)
+            
+            # 해당 segment 전체를 평균 depth로 설정
+            segment_depth_map[mask] = mean_depth
+    
+    # 0-1로 정규화 (값이 클수록 가까움 유지)
+    if segment_depth_map.max() > segment_depth_map.min():
+        depth_norm = (segment_depth_map - segment_depth_map.min()) / (segment_depth_map.max() - segment_depth_map.min())
     else:
-        bg_array = background_img.copy()
-
-    bg_h, bg_w = bg_array.shape[:2]
-
-    # 누끼 객체를 numpy로 변환
-    if overlay_img.mode != 'RGBA':
-        overlay_img = overlay_img.convert('RGBA')
-    overlay_array = np.array(overlay_img)
-    overlay_h, overlay_w = overlay_array.shape[:2]
-
-    # 누끼 객체의 RGB와 알파 채널 분리
-    overlay_rgb = overlay_array[:, :, :3]
-    overlay_alpha = overlay_array[:, :, 3] / 255.0  # 0-1 범위로 정규화
-
-    # 배경 depth를 0-1로 정규화 (캐싱 가능하지만 여기서는 빠르므로 그대로)
-    if background_depth.max() > background_depth.min():
-        bg_depth_norm = (background_depth - background_depth.min()) / (background_depth.max() - background_depth.min())
-    else:
-        bg_depth_norm = np.zeros_like(background_depth)
-
-    # 합성 위치 계산
-    x_offset, y_offset = overlay_position
-
-    # 합성 영역 계산 (이미지 범위를 벗어나지 않도록)
-    x_start = max(0, x_offset)
-    y_start = max(0, y_offset)
-    x_end = min(bg_w, x_offset + overlay_w)
-    y_end = min(bg_h, y_offset + overlay_h)
-
-    # 누끼 객체에서 실제로 사용할 영역
-    overlay_x_start = max(0, -x_offset)
-    overlay_y_start = max(0, -y_offset)
-    overlay_x_end = overlay_x_start + (x_end - x_start)
-    overlay_y_end = overlay_y_start + (y_end - y_start)
-
-    if x_end <= x_start or y_end <= y_start:
-        # 겹치는 영역이 없으면 배경만 반환
-        return background_img
-
-    # 해당 영역의 배경 depth 가져오기
-    region_bg_depth = bg_depth_norm[y_start:y_end, x_start:x_end]
-
-    # 누끼 객체 영역 추출
-    region_overlay_rgb = overlay_rgb[overlay_y_start:overlay_y_end, overlay_x_start:overlay_x_end]
-    region_overlay_alpha = overlay_alpha[overlay_y_start:overlay_y_end, overlay_x_start:overlay_x_end]
-
-    # Depth 기반 occlusion mask 생성
-    # overlay_depth_value보다 배경이 가까우면 (depth 값이 크면) 누끼를 지움
-    # 배경 depth가 더 크다 = 배경이 더 가깝다 = 누끼를 가려야 함
-    should_hide = region_bg_depth > overlay_depth_value
-
-    # 알파 값을 occlusion으로 조정
-    # should_hide가 True인 곳은 알파를 0으로 (배경이 보임)
-    adjusted_alpha = region_overlay_alpha.copy()
-    adjusted_alpha[should_hide] = 0
-
-    # 알파 블렌딩: 누끼를 배경 위에 덮어씀
-    adjusted_alpha_3d = adjusted_alpha[:, :, np.newaxis]  # (H, W, 1)로 확장
-
-    bg_array[y_start:y_end, x_start:x_end] = (
-        adjusted_alpha_3d * region_overlay_rgb +
-        (1 - adjusted_alpha_3d) * bg_array[y_start:y_end, x_start:x_end]
-    ).astype(np.uint8)
-
-    return Image.fromarray(bg_array)
+        depth_norm = np.zeros_like(segment_depth_map)
+    
+    BG_CACHE[bg_name] = (bg_img, depth_vis, depth_norm, annotations)
+    return bg_img, depth_vis, depth_norm, annotations
 
 
-def resize_overlay_keep_aspect(overlay_img, max_width, max_height):
-    """
-    누끼 객체를 비율 유지하며 리사이즈
+def composite_preview(bg_name, overlay_name, depth_value, x_pos, y_pos, overlay_scale):
+    """미리보기 합성"""
+    if not bg_name or not overlay_name:
+        return None
+    
+    bg_img, _, depth_norm, annotations = load_background(bg_name)
+    if bg_img is None:
+        return None
+    
+    overlay_path = OVERLAY_DIR / overlay_name
+    if not overlay_path.exists():
+        return bg_img
+    
+    overlay_img = Image.open(overlay_path).convert("RGBA")
+    
+    # 스케일 조정
+    if overlay_scale != 100:
+        w, h = overlay_img.size
+        new_w = int(w * overlay_scale / 100)
+        new_h = int(h * overlay_scale / 100)
+        overlay_img = overlay_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    result = composite_with_depth(
+        bg_img,
+        depth_norm,  # segment별 평균 depth map
+        overlay_img,
+        depth_value,
+        (int(x_pos), int(y_pos))
+    )
+    
+    return result
 
-    Args:
-        overlay_img: PIL 이미지
-        max_width: 최대 너비
-        max_height: 최대 높이
 
-    Returns:
-        리사이즈된 PIL 이미지
-    """
-    w, h = overlay_img.size
-    aspect = w / h
+def render_final(bg_name, overlay_name, depth_value, x_pos, y_pos, overlay_scale):
+    """최종 이미지 렌더링"""
+    result = composite_preview(bg_name, overlay_name, depth_value, x_pos, y_pos, overlay_scale)
+    
+    if result is None:
+        return None, "No image to render"
+    
+    # 결과 저장
+    output_path = BASE_DIR / "output" / f"composed_{bg_name}"
+    output_path.parent.mkdir(exist_ok=True)
+    result.save(output_path)
+    
+    return result, f"Saved to: {output_path}"
 
-    if w > max_width or h > max_height:
-        if w / max_width > h / max_height:
-            new_w = max_width
-            new_h = int(max_width / aspect)
-        else:
-            new_h = max_height
-            new_w = int(max_height * aspect)
 
-        return overlay_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+def upload_overlay(files):
+    """누끼 이미지 업로드"""
+    if files is None:
+        return "No files uploaded", gr.Dropdown(choices=get_overlay_list())
+    
+    uploaded = []
+    for file in files:
+        filename = Path(file.name).name
+        save_path = OVERLAY_DIR / filename
+        Image.open(file.name).save(save_path)
+        uploaded.append(filename)
+    
+    new_list = get_overlay_list()
+    return f"Uploaded: {', '.join(uploaded)}", gr.Dropdown(choices=new_list, value=new_list[0] if new_list else None)
 
-    return overlay_img
+
+# Gradio UI
+with gr.Blocks(title="Depth-Based Compositor", css="""
+    .draggable { cursor: move; }
+    .controls { background: #f5f5f5; padding: 15px; border-radius: 8px; }
+""") as demo:
+    
+    gr.Markdown("# 🎨 Depth-Based Image Compositor")
+    gr.Markdown("배경 이미지에 누끼 객체를 깊이 기반으로 합성합니다. 드래그로 위치 조정, depth로 앞뒤 조절")
+    
+    with gr.Row():
+        # 왼쪽: 설정
+        with gr.Column(scale=1, elem_classes="controls"):
+            gr.Markdown("### 📂 Files")
+            
+            # 배경 이미지 선택
+            bg_list = get_background_list()
+            bg_dropdown = gr.Dropdown(
+                choices=bg_list,
+                label="Background Image",
+                value=bg_list[0] if bg_list else None,
+                allow_custom_value=False
+            )
+            
+            # 누끼 업로드
+            overlay_upload = gr.File(
+                label="Upload Overlay (PNG with transparency)",
+                file_count="multiple",
+                file_types=[".png"]
+            )
+            upload_status = gr.Textbox(label="Upload Status", interactive=False)
+            
+            # 누끼 선택
+            overlay_list = get_overlay_list()
+            overlay_dropdown = gr.Dropdown(
+                choices=overlay_list,
+                label="Overlay Image",
+                value=overlay_list[0] if overlay_list else None,
+                allow_custom_value=False
+            )
+            
+            gr.Markdown("### 🎚️ Controls")
+            
+            # Depth 슬라이더
+            depth_slider = gr.Slider(
+                minimum=-0.5,
+                maximum=1.5,
+                value=0.5,
+                step=0.01,
+                label="Depth (1=앞, 0=뒤)",
+                info="값이 클수록 카메라에 가까움 (앞). -0.5=배경 전체보다 뒤, 1.5=배경 전체보다 앞"
+            )
+            
+            # 위치 조정 (누끼 이미지 중앙 기준)
+            x_slider = gr.Slider(
+                minimum=-500,
+                maximum=2000,
+                value=500,
+                step=1,
+                label="X Position (중앙)"
+            )
+            
+            y_slider = gr.Slider(
+                minimum=-500,
+                maximum=2000,
+                value=500,
+                step=1,
+                label="Y Position (중앙)"
+            )
+            
+            # 크기 조정
+            scale_slider = gr.Slider(
+                minimum=10,
+                maximum=300,
+                value=100,
+                step=5,
+                label="Scale (%)"
+            )
+            
+            # 버튼들
+            with gr.Row():
+                preview_btn = gr.Button("🔄 Preview", variant="secondary")
+                render_btn = gr.Button("💾 Render & Save", variant="primary")
+        
+        # 오른쪽: 미리보기
+        with gr.Column(scale=2):
+            gr.Markdown("### 🖼️ Preview")
+            
+            with gr.Tabs():
+                with gr.Tab("Composite"):
+                    composite_output = gr.Image(
+                        label="Composite Result",
+                        type="pil",
+                        height=600,
+                        elem_classes="draggable"
+                    )
+                
+                with gr.Tab("Background"):
+                    bg_preview = gr.Image(
+                        label="Background Image",
+                        type="pil",
+                        height=600
+                    )
+                
+                with gr.Tab("Depth Map"):
+                    depth_preview = gr.Image(
+                        label="Background Depth",
+                        type="numpy",
+                        height=600
+                    )
+            
+            render_status = gr.Textbox(label="Render Status", interactive=False)
+    
+    # 이벤트 핸들러
+    
+    # 배경 이미지 로드
+    def on_bg_change(bg_name):
+        bg_img, depth_vis, _, annotations = load_background(bg_name)
+        if bg_img:
+            w, h = bg_img.size
+            return (
+                bg_img, 
+                depth_vis,
+                gr.Slider(minimum=-w//2, maximum=int(w*1.5), value=w//2, step=1),
+                gr.Slider(minimum=-h//2, maximum=int(h*1.5), value=h//2, step=1)
+            )
+        return bg_img, depth_vis, gr.Slider(), gr.Slider()
+    
+    bg_dropdown.change(
+        fn=on_bg_change,
+        inputs=[bg_dropdown],
+        outputs=[bg_preview, depth_preview, x_slider, y_slider]
+    )
+    
+    # 누끼 업로드
+    overlay_upload.upload(
+        fn=upload_overlay,
+        inputs=[overlay_upload],
+        outputs=[upload_status, overlay_dropdown]
+    )
+    
+    # 미리보기 업데이트
+    def auto_preview(bg_name, overlay_name, depth_value, x_pos, y_pos, scale):
+        return composite_preview(bg_name, overlay_name, depth_value, x_pos, y_pos, scale)
+    
+    preview_inputs = [
+        bg_dropdown,
+        overlay_dropdown,
+        depth_slider,
+        x_slider,
+        y_slider,
+        scale_slider
+    ]
+    
+    # Preview 버튼
+    preview_btn.click(
+        fn=auto_preview,
+        inputs=preview_inputs,
+        outputs=composite_output
+    )
+    
+    # 실시간 미리보기 (슬라이더 변경 시)
+    for inp in preview_inputs:
+        inp.change(
+            fn=auto_preview,
+            inputs=preview_inputs,
+            outputs=composite_output
+        )
+    
+    # Render 버튼
+    render_btn.click(
+        fn=render_final,
+        inputs=preview_inputs,
+        outputs=[composite_output, render_status]
+    )
+    
+    # 초기 로드
+    def initial_load():
+        bg_list = get_background_list()
+        overlay_list = get_overlay_list()
+        
+        bg_img, depth_vis = None, None
+        x_update = gr.Slider()
+        y_update = gr.Slider()
+        
+        if bg_list:
+            bg_img, depth_vis, _, _ = load_background(bg_list[0])
+            if bg_img:
+                w, h = bg_img.size
+                x_update = gr.Slider(minimum=-w//2, maximum=int(w*1.5), value=w//2, step=1)
+                y_update = gr.Slider(minimum=-h//2, maximum=int(h*1.5), value=h//2, step=1)
+        
+        return (
+            bg_img, 
+            depth_vis,
+            gr.Dropdown(choices=bg_list, value=bg_list[0] if bg_list else None),
+            gr.Dropdown(choices=overlay_list, value=overlay_list[0] if overlay_list else None),
+            x_update,
+            y_update
+        )
+    
+    demo.load(
+        fn=initial_load,
+        inputs=None,
+        outputs=[bg_preview, depth_preview, bg_dropdown, overlay_dropdown, x_slider, y_slider]
+    )
 
 
 if __name__ == "__main__":
-    import gradio as gr
-    from pathlib import Path
-    import sys
-
-    BASE_DIR = Path(__file__).resolve().parent
-    sys.path.insert(0, str(BASE_DIR))
-
-    from depth import compute_depth
-
-    def demo_composite(background_img, overlay_img, depth_value, x_pos, y_pos):
-        """Gradio demo function for depth-based compositing"""
-        if background_img is None or overlay_img is None:
-            return None
-
-        # Convert to PIL if needed
-        if isinstance(background_img, np.ndarray):
-            background_img = Image.fromarray(background_img)
-        if isinstance(overlay_img, np.ndarray):
-            overlay_img = Image.fromarray(overlay_img)
-
-        # Compute depth for background
-        _, bg_depth = compute_depth(background_img)
-
-        # Composite
-        result = composite_with_depth(
-            background_img,
-            bg_depth,
-            overlay_img,
-            depth_value,
-            (int(x_pos), int(y_pos))
-        )
-
-        return result
-
-    # Gradio interface
-    with gr.Blocks(title="Depth-Based Image Compositor") as demo:
-        gr.Markdown("# Depth-Based Image Compositor")
-        gr.Markdown("Upload a background image and an overlay image (with transparency) to composite them based on depth.")
-
-        with gr.Row():
-            with gr.Column():
-                bg_input = gr.Image(label="Background Image", type="pil")
-                overlay_input = gr.Image(label="Overlay Image (RGBA)", type="pil")
-
-            with gr.Column():
-                depth_slider = gr.Slider(0, 1, value=0.5, label="Overlay Depth (0=far, 1=near)")
-                x_slider = gr.Slider(0, 1000, value=0, step=1, label="X Position")
-                y_slider = gr.Slider(0, 1000, value=0, step=1, label="Y Position")
-                composite_btn = gr.Button("Composite")
-
-        output_img = gr.Image(label="Result", type="pil")
-
-        composite_btn.click(
-            fn=demo_composite,
-            inputs=[bg_input, overlay_input, depth_slider, x_slider, y_slider],
-            outputs=output_img
-        )
-
-    demo.launch(server_name="0.0.0.0", server_port=8081, share=True)
+    demo.launch(server_name="0.0.0.0", server_port=8082, share=True)

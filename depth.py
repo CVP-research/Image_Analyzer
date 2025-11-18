@@ -54,13 +54,13 @@ CMAP_LUT = (depth_cmap(np.arange(256))[:, :3] * 255).astype(np.uint8)
 def compute_depth(image_pil):
     """
     DepthAnythingV2 depth 추론 → (depth_png_numpy, depth_raw_numpy)
+    depth_raw: 값이 클수록 카메라에 가까움 (앞)
     """
     raw = np.array(image_pil)[:, :, ::-1]  # PIL -> BGR
     depth_raw = depth_model.infer_image(raw, INPUT_SIZE)
 
-    # 깊이 값 반전: 가까운 곳은 밝게, 먼 곳은 어둡게
+    # 시각화를 위해 0-255로 변환 (가까운 곳은 밝게)
     d_norm = (depth_raw - depth_raw.min()) / (depth_raw.max() - depth_raw.min())
-    d_norm = 1.0 - d_norm  # 반전
     depth_uint8 = (d_norm * 255).astype(np.uint8)
 
     depth_color = CMAP_LUT[depth_uint8]
