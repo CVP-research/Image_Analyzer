@@ -1,6 +1,5 @@
 # server.py
 import os
-import pickle
 from pathlib import Path
 import queue
 from threading import Thread
@@ -13,46 +12,28 @@ from depth import compute_depth
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
-SEGMENT_DIR = BASE_DIR / "segment"
-DEPTH_DIR = BASE_DIR / "depth"
-
-SEGMENT_DIR.mkdir(exist_ok=True)
-DEPTH_DIR.mkdir(exist_ok=True)
 
 IMAGE_LIST = None
 CACHE = {}
 cache_queue = queue.Queue()
 
 
-def build_tag_html(annotations, json_data):
-    # 이 함수는 사용되지 않지만, 다른 곳에서 호출될까봐 일단 유지합니다.
-    if not annotations or not json_data:
-        return "<div style='color:#888;'>No segments detected</div>"
-    return ""
-
-
 def calculate_mean_depths(depth_raw, annotations):
     """각 세그먼트 마스크에 해당하는 평균 깊이를 계산합니다."""
     mean_depths = {}
     
-    for item in annotations:
+    for mask, label in annotations:
         try:
-            mask = item[0]
-            label = item[1]
-            
-            if isinstance(mask, np.ndarray) and mask.shape == depth_raw.shape:
-                segment_depths = depth_raw[mask.astype(bool)]
-                valid_depths = segment_depths[segment_depths > 0]
-                
-                if valid_depths.size > 0:
-                    mean_depths[label] = np.mean(valid_depths)
-                else:
-                    mean_depths[label] = np.nan
-            
+            segment_depths = depth_raw[mask]
+            if segment_depths.size > 0:
+                mean_depths[label] = np.mean(segment_depths)
+            else:
+                mean_depths[label] = np.nan
         except Exception:
             continue
             
     return mean_depths
+
 
 def format_mean_depths(mean_depths, json_data):
     """
@@ -89,42 +70,19 @@ def load_image_list():
 
 def process_full(image_path):
     """
-    segmentation + depth 전처리 및 결과 저장
+    segmentation + depth 처리 (메모리에서만 처리)
     """
     pil_img = Image.open(image_path).convert("RGB")
-    base = image_path.stem
-
-    seg_meta_path = SEGMENT_DIR / f"{base}_seg.pkl"
-    depth_png_path = DEPTH_DIR / f"{base}_depth.png"
-    depth_raw_path = DEPTH_DIR / f"{base}_depth.npy"
-
-    if not seg_meta_path.exists():
-        annotations, json_data = run_segmentation(pil_img)
-        with seg_meta_path.open("wb") as f:
-            pickle.dump({"annotations": annotations, "json": json_data}, f)
-    else:
-        with seg_meta_path.open("rb") as f:
-            meta = pickle.load(f)
-        annotations = meta["annotations"]
-        json_data = meta["json"]
-
-    if not depth_png_path.exists() or not depth_raw_path.exists():
-        depth_png, depth_raw = compute_depth(pil_img)
-        Image.fromarray(depth_png).save(depth_png_path)
-        np.save(depth_raw_path, depth_raw)
-    else:
-        depth_png = np.array(Image.open(depth_png_path).convert("RGB"))
-        depth_raw = np.load(depth_raw_path)
-
-    # 원본 이미지를 base로 사용 (PIL Image 그대로)
+    
+    annotations, json_data = run_segmentation(pil_img)
+    depth_png, depth_raw = compute_depth(pil_img)
     mean_depths = calculate_mean_depths(depth_raw, annotations)
 
-    # show 함수의 반환 값 순서에 맞춰 튜플 반환 (총 4개)
     return (
-        (pil_img, annotations),  # seg (AnnotatedImage input format: PIL Image + annotations)
-        json_data,               # json_data
-        depth_png,               # depth_png
-        mean_depths              # Mean depths dictionary
+        (pil_img, annotations),
+        json_data,
+        depth_png,
+        mean_depths
     )
 
 def preload_worker():
@@ -157,20 +115,17 @@ def show(idx):
         if 0 <= t < len(img_list) and t not in CACHE:
             cache_queue.put(t)
 
-    # process_full의 반환 값 4개
     seg, json_data, depth_png, mean_depths = CACHE[idx]
     info = f"Image {idx+1}/{len(img_list)}\nFile: {img_list[idx].name}"
-
     mean_depths_str = format_mean_depths(mean_depths, json_data)
 
-    # Gradio의 outputs과 일치하는 6개 요소 반환
     return (
-        info,                  # 1. info (info_box)
-        seg,                   # 2. seg (seg_out) - (PIL Image, annotations) 튜플
-        depth_png,             # 3. depth_png (depth_out)
-        json_data,             # 4. json_data (json_out)
-        mean_depths_str,       # 5. mean_depths_str (mean_depths_out)
-        idx                    # 6. current (current)
+        info,
+        seg,
+        depth_png,
+        json_data,
+        mean_depths_str,
+        idx
     )
 
 with gr.Blocks(title="Segment + Depth Viewer") as demo:

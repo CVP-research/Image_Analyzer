@@ -1,6 +1,6 @@
 # segment.py
 import numpy as np
-from PIL import Image
+import cv2
 from transformers import pipeline
 
 # Segment model (GPU)
@@ -41,7 +41,7 @@ def run_segmentation(image_pil):
     for idx, r in enumerate(results):
         mask = np.array(r["mask"])
         if mask.shape[:2] != image_pil.size[::-1]:
-            mask = np.array(Image.fromarray(mask).resize(image_pil.size))
+            mask = cv2.resize(mask.astype(np.uint8), image_pil.size, interpolation=cv2.INTER_NEAREST)
 
         mask_bool = mask > 128
         color = distinct_colors[idx % len(distinct_colors)]

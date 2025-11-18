@@ -1,8 +1,14 @@
+# Core dependencies
 gradio
 transformers
 pillow
 numpy
-torch
-matplotlib
-torchvision
+opencv-python
 timm
+scipy
+
+# PyTorch (install separately based on your system)
+# Visit: https://pytorch.org/get-started/locally/
+torch
+torchvision
+matplotlib
