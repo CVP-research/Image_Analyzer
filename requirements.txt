@@ -1,0 +1,8 @@
+gradio
+transformers
+pillow
+numpy
+torch
+matplotlib
+torchvision
+timm
