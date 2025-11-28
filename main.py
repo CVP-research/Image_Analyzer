@@ -2,9 +2,9 @@
 Few-shot Semantic Compositing Pipeline - Main Entry Point
 
 전체 파이프라인:
-1. [TODO] 입력 이미지에서 뷰가 좋은 3장 선택
-2. [TODO] Veo3로 프레임 생성
-3. [TODO] 객체만 segmentation
+1. [TODO] 입력 이미지에서 가장 좋은 3장 선택
+2. [IMPLEMENTED] Veo3로 360도 뷰 영상 생성 (시뮬레이션)
+3. [IMPLEMENTED] 객체만 segmentation
 4. [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
 5. [TODO] 자연스러운 합성 (depth, lighting)
 
@@ -17,10 +17,19 @@ Few-shot Semantic Compositing Pipeline - Main Entry Point
 - semantic_matcher.py: 의미론적 배경 매칭
 """
 
+import random
+import time
 from pathlib import Path
 from PIL import Image
 import numpy as np
 from typing import List, Dict, Tuple
+import os
+import base64
+import cv2
+from ultralytics import SAM
+
+from google import genai
+from google.genai import types
 
 from semantic_matcher import SemanticMatcher
 from composite import composite_on_segment
@@ -30,16 +39,44 @@ from composite import composite_on_segment
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "dataset" / "train"
 INPUT_DIR = BASE_DIR / "input"
-OUTPUT_DIR = BASE_DIR / "output" / "compositing_results"
+VIDEO_DIR = BASE_DIR / "output" / "video"
+OUTPUT_DIR = BASE_DIR / "output" / "dataset"
+MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames" # New
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True) # New
+# Generative AI 클라이언트 초기화 (인증은 환경 변수 또는 genai.configure()를 통해 외부에서 처리된다고 가정)
+try:
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
+    client = genai.Client(
+        vertexai=True,
+        project="gen-lang-client-0127629302",
+        location="us-central1"
+    )
+except Exception as e:
+    print(f"Error initializing Google Generative AI client: {e}")
+    client = None # 클라이언트 초기화 실패 시 None으로 설정
 
+# Global variable for the SAM model to ensure it's loaded only once.
+SAM_MODEL = None
+
+def get_sam_model():
+    """Loads and returns the SAM model, caching it globally."""
+    global SAM_MODEL
+    if SAM_MODEL is None:
+        print("Loading SAM model...")
+        SAM_MODEL = SAM("sam2_l.pt")
+        print("SAM model loaded.")
+    return SAM_MODEL
 
 # ============================================================
-# Step 1: 입력 이미지에서 뷰가 좋은 3장 선택
+# Step 1: 입력 이미지에서 랜덤으로 3장 선택
 # ============================================================
 def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path]:
     """
-    [TODO] 입력 이미지에서 뷰가 좋은 상위 N장을 선택
+    입력 이미지에서 N장을 랜덤으로 선택
+    
+    [TODO] 추후 이미지 품질, 객체 가시성, 다양성을 고려한 뷰 선택 알고리즘으로 교체
     
     Args:
         input_images: 입력 이미지 경로 리스트
@@ -47,86 +84,249 @@ def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path
     
     Returns:
         선택된 이미지 경로 리스트
-    
-    구현 가이드:
-        - 이미지 품질 평가 (블러, 노이즈, 해상도)
-        - 객체 가시성 평가 (occlusion, 각도)
-        - 다양성 평가 (서로 다른 각도)
     """
-    print(f"\n[Step 1] Selecting best {num_views} views from {len(input_images)} images...")
-    print("[TODO] Implement view selection algorithm")
+    print(f"\n[Step 1] Selecting {num_views} random views from {len(input_images)} images...")
     
-    # 임시: 처음 N개 반환
-    selected = input_images[:num_views]
+    if len(input_images) <= num_views:
+        print("  Number of images is less than or equal to num_views. Using all images.")
+        selected = input_images
+    else:
+        selected = random.sample(input_images, num_views)
+        
     print(f"  Selected: {[img.name for img in selected]}")
     return selected
 
 
 # ============================================================
-# Step 2: Veo3로 프레임 생성
+# Step 2: Veo3로 360도 뷰 영상 생성
 # ============================================================
-def generate_frames_with_veo3(selected_images: List[Path]) -> List[Image.Image]:
+def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
     """
-    [TODO] Veo3 모델을 사용해 선택된 이미지로부터 프레임 생성
+    Veo3 API를 호출하여 360도 뷰 영상 생성 (GCS 업로드 없이 로컬 이미지로 직접 호출)
+
+    Args:
+        selected_images: 선택된 로컬 이미지 경로 리스트
+
+    Returns:
+        생성된 360도 영상 파일 경로 (로컬 저장)
+    """
+    print(f"\n[Step 2] Generating 360° video with Veo3 API...")
+
+    # ------------------------------------
+    # 1) Prompt 구성
+    # ------------------------------------
+    prompt_text = (
+        f"Generate a high-fidelity 360-degree panoramic video of the object shown in the provided reference images.\n"
+        f"Requirements:\n"
+        f"1. The object must be fully visible in every frame; no parts should be cropped or cut off.\n"
+        f"2. Maintain consistent scale, orientation, and position of the object across all frames.\n"
+        f"3. Ensure smooth rotation; no sudden jumps, distortions, or unnatural movements.\n"
+        f"4. The background should be minimal, neutral, or lightly styled, emphasizing the object.\n"
+        f"5. Ensure consistent lighting, perspective, and color tone throughout.\n"
+        f"6. Produce frames of uniform high visual fidelity, suitable for downstream training datasets.\n"
+        f"7. Avoid any sudden changes or anomalies between consecutive frames.\n"
+        f"Duration: 5 seconds."
+    )
+
+    selected_images.insert(0, INPUT_DIR / "input.png")
+    print("  Calling Veo API... This may take a while...")
+    reference_images = [types.VideoGenerationReferenceImage(
+                        image=types.Image.from_file(location=str(file)),
+                        reference_type="asset",
+                    ) for file in selected_images]
+    
+    try:
+        operation = client.models.generate_videos(
+            model="veo-3.1-generate-preview",
+            source=types.GenerateVideosSource(prompt=prompt_text),
+            config=types.GenerateVideosConfig(
+                reference_images=reference_images[:3],
+                aspect_ratio="16:9",
+            ),
+        )
+
+        # Poll until done
+        while not operation.done:
+            print("  Waiting for video generation...")
+            time.sleep(15)
+            operation = client.operations.get(operation)
+
+        print("  ✓ Video generation completed!")
+        print(operation.response)
+        print(operation.result)
+        if operation.response and operation.result.generated_videos:
+            video_bytes = operation.result.generated_videos[0].video.video_bytes
+
+            local_path = VIDEO_DIR / f"veo3_output_{int(time.time())}.mp4"
+            with open(local_path, "wb") as f:
+                f.write(video_bytes)
+
+            print(f"  ✓ Saved generated video locally: {local_path}")
+            return local_path
+
+
+    except Exception as e:
+        print(f"  Veo API Exception: {e}")
+        raise e
+
+
+def frame_from_video(video_path: Path, output_dir: Path) -> None:
+    """
+    Veo3로 생성된 360도 영상에서 유일한 프레임만 분리 및 저장
     
     Args:
-        selected_images: 선택된 이미지 경로 리스트
-    
-    Returns:
-        생성된 프레임 이미지 리스트
-    
-    구현 가이드:
-        - Veo3 API 호출
-        - 프레임 생성 파라미터 설정
-        - 생성된 프레임 후처리
+        video_path: Veo3에서 생성된 360도 영상 파일 경로
+        output_dir: 분리된 프레임 저장 디렉토리 경로
     """
-    print(f"\n[Step 2] Generating frames with Veo3...")
-    print("[TODO] Implement Veo3 frame generation")
-    
-    # 임시: 원본 이미지를 PIL로 로드해서 반환
-    frames = [Image.open(img).convert("RGB") for img in selected_images]
-    print(f"  Generated {len(frames)} frames")
-    return frames
+    import cv2
+    import numpy as np
+    import hashlib
+
+    print(f"\n[Frame Extraction] Extracting unique frames from video: {video_path.name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    frame_idx = 0
+    saved_idx = 0
+    seen_hashes = set()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # 프레임을 해시로 변환
+        frame_hash = hashlib.md5(frame.tobytes()).hexdigest()
+        if frame_hash in seen_hashes:
+            frame_idx += 1
+            continue  # 이미 저장된 프레임이면 건너뜀
+
+        seen_hashes.add(frame_hash)
+        frame_filename = output_dir / f"frame_{saved_idx:04d}.png"
+        cv2.imwrite(str(frame_filename), frame)
+        print(f"  Saved unique frame: {frame_filename.name}")
+        frame_idx += 1
+        saved_idx += 1
+
+    cap.release()
+    print(f"  ✓ Extracted {saved_idx} unique frames to {output_dir}")
+
 
 
 # ============================================================
 # Step 3: 객체만 segmentation
 # ============================================================
-def segment_objects(frames: List[Image.Image]) -> List[Tuple[Image.Image, Dict]]:
+def segment_objects(frame_dir: Path) -> None: # Modified return type
     """
-    [TODO] 생성된 프레임에서 객체만 segmentation
-    
-    임시: input 폴더의 누끼 이미지(PNG)를 로드
-    
+    Segments the main object from each frame in a directory and saves them to MASKED_FRAMES_DIR.
+
     Args:
-        frames: 프레임 이미지 리스트 (사용 안 함, TODO)
-    
-    Returns:
-        [(누끼 이미지, 메타데이터)] 리스트
+        frame_dir: Directory containing the image frames to segment.
     """
-    print(f"\n[Step 3] Loading overlay images from input...")
+    print(f"\n[Step 3] Segmenting objects from frames in {frame_dir} and saving to {MASKED_FRAMES_DIR}...")
     
-    # input 폴더에서 PNG 파일 찾기
-    overlay_files = sorted(INPUT_DIR.glob("*.png"))
+    model = get_sam_model()
     
-    results = []
-    for idx, overlay_path in enumerate(overlay_files):
-        # 누끼 이미지 로드 (RGBA)
-        overlay_img = Image.open(overlay_path).convert("RGBA")
+    frames = sorted([p for p in frame_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+
+    if not frames:
+        print(f"  Warning: No frames found in {frame_dir} to segment.")
+        return
+
+    for idx, frame_path in enumerate(frames):
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            print(f"[WARN] Cannot read {frame_path.name}, skipping.")
+            continue
+
+        pred_results = model.predict(img, task="segment")
+
+        if not pred_results or not hasattr(pred_results[0], 'masks') or pred_results[0].masks is None:
+            print(f"[WARN] No mask detected in {frame_path.name}, skipping.")
+            continue
+
+        largest_mask = None
+        largest_area = 0
+        for mask in pred_results[0].masks.data:
+            mask_np = mask.cpu().numpy().astype(np.uint8)
+            area = mask_np.sum()
+            if area > largest_area:
+                largest_area = area
+                largest_mask = mask_np
+
+        if largest_mask is None:
+            print(f"[WARN] No mask data found in {frame_path.name}, skipping.")
+            continue
+
+        largest_mask = 1 - largest_mask
+        kernel = np.ones((5, 5), np.uint8)
+        largest_mask = cv2.erode(largest_mask, kernel, iterations=1)
+
+        obj_only = np.zeros_like(img)
+        obj_only[largest_mask == 1] = img[largest_mask == 1]
+        alpha = (largest_mask * 255).astype(np.uint8)
+        rgba_cv = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
+        rgba_cv[:, :, 3] = alpha
         
-        metadata = {
-            "frame_idx": idx,
-            "category": "object",
-            "filename": overlay_path.name
-        }
+        rgba_pil = Image.fromarray(cv2.cvtColor(rgba_cv, cv2.COLOR_BGRA2RGBA))
+
+        out_path = MASKED_FRAMES_DIR / f"{frame_path.stem}_masked.png"
+        rgba_pil.save(out_path)
+        print(f"  ✓ Segmented and saved: {out_path.name}")
+    print(f"  Completed segmentation of {len(frames)} frames.")
+
+
+def get_all_objects() -> List[Tuple[Image.Image, Dict]]:
+    """
+    Loads all segmented object images from MASKED_FRAMES_DIR and original input
+    images from INPUT_DIR, returning them with metadata.
+
+    Returns:
+        A list of tuples, where each tuple contains an object image (PIL RGBA)
+        and its metadata.
+    """
+    objects = []
+    
+    # Load from MASKED_FRAMES_DIR (segmented video frames)
+    print(f"\n[Step 3c] Loading segmented frames from {MASKED_FRAMES_DIR}...")
+    masked_files = sorted([p for p in MASKED_FRAMES_DIR.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+    
+    for idx, file_path in enumerate(masked_files):
+        try:
+            img = Image.open(file_path).convert("RGBA")
+            metadata = {
+                "frame_idx": idx,
+                "category": "object", # Assuming all are objects
+                "filename": file_path.name
+            }
+            objects.append((img, metadata))
+            print(f"  Loaded masked frame: {file_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not load masked frame {file_path.name}: {e}")
+
+    # Load from INPUT_DIR (original input images, assumed to be pre-masked or objects)
+    print(f"\n[Step 3d] Loading original input images from {INPUT_DIR}...")
+    original_files = sorted([p for p in INPUT_DIR.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+    
+    start_idx = len(objects) # Continue indexing from where masked_files left off
+
+    for i, file_path in enumerate(original_files):
+        try:
+            img = Image.open(file_path).convert("RGBA")
+            metadata = {
+                "frame_idx": start_idx + i,
+                "category": "object", # Assuming all are objects
+                "filename": file_path.name
+            }
+            objects.append((img, metadata))
+            print(f"  Loaded original input image: {file_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not load original input image {file_path.name}: {e}")
+            
+    if not objects:
+        print("  Warning: No objects were loaded from any directory.")
         
-        results.append((overlay_img, metadata))
-        print(f"  Loaded: {overlay_path.name}")
-    
-    if not results:
-        print("  Warning: No PNG files found in input folder")
-    
-    return results
+    return objects
 
 
 # ============================================================
@@ -327,11 +527,15 @@ def run_full_pipeline(
     # Step 1: 뷰 선택
     selected_views = select_best_views(input_images, num_views=num_views)
     
-    # Step 2: Veo3 프레임 생성
-    frames = generate_frames_with_veo3(selected_views)
+    # Step 2: Veo3 360도 영상 생성
+    video_path = generate_360_video_with_veo3(selected_views)
+
+    # 프레임 분리
+    frames_dir = OUTPUT_DIR / "frames"
+    frame_from_video(video_path, frames_dir)
     
     # Step 3: 객체 segmentation
-    objects = segment_objects(frames)
+    segment_objects(frames_dir)
     
     # Step 4: 적합한 배경 찾기
     backgrounds = find_suitable_backgrounds(
@@ -347,6 +551,8 @@ def run_full_pipeline(
         print("Error: No suitable backgrounds found!")
         return []
     
+    objects = get_all_objects()
+
     # Step 5: 자연스러운 합성
     output_paths = composite_naturally(
         objects=objects,
@@ -370,16 +576,16 @@ def main():
     메인 엔트리 포인트
     
     전체 파이프라인:
-    1. [TODO] 입력 이미지 중 뷰가 좋은 3장 선택
-    2. [TODO] Veo3로 프레임 생성
-    3. [TODO] 객체만 segmentation
+    1. [IMPLEMENTED] 입력 이미지 중 랜덤으로 3장 선택
+    2. [IMPLEMENTED] Veo3로 360도 뷰 영상 생성 (시뮬레이션)
+    3. [IMPLEMENTED] 객체만 segmentation
     4. [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
     5. [TODO] 자연스러운 합성 (depth, lighting)
     """
     print("=== Few-shot Semantic Compositing Pipeline ===")
-    print("[TODO] Step 1: Select 3 best views from input images")
-    print("[TODO] Step 2: Generate frames with Veo3")
-    print("[TODO] Step 3: Segment objects only")
+    print("[IMPLEMENTED] Step 1: Select 3 random views from input images")
+    print("[IMPLEMENTED] Step 2: Generate 360° video with Veo3 (Simulated)")
+    print("[IMPLEMENTED] Step 3: Segment objects from video")
     print("[IMPLEMENTED] Step 4: Find semantically suitable backgrounds")
     print("[TODO] Step 5: Composite naturally with depth and lighting")
     print()
