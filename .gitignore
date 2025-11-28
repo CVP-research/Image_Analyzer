@@ -207,13 +207,9 @@ marimo/_lsp/
 __marimo__/
 
 # Input images
-input/*.jpg
-input/*.jpeg
-input/*.png
+input/
 
-output/*.jpg
-output/*.jpeg
-output/*.png
+output/
 
 # Depth Anything V2 checkpoints
 Depth-Anything-V2/checkpoints/*.pth
@@ -223,3 +219,5 @@ Depth-Anything-V2/checkpoints/*.pt
 .gradio/
 .dataset_cache/
 dataset/
+credentials.json
+*.pt

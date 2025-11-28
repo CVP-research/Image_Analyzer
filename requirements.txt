@@ -6,6 +6,7 @@ numpy
 opencv-python
 timm
 scipy
+ultralytics
 
 # PyTorch (install separately based on your system)
 # Visit: https://pytorch.org/get-started/locally/
