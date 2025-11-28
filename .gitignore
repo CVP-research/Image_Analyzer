@@ -211,9 +211,15 @@ input/*.jpg
 input/*.jpeg
 input/*.png
 
+output/*.jpg
+output/*.jpeg
+output/*.png
+
 # Depth Anything V2 checkpoints
 Depth-Anything-V2/checkpoints/*.pth
 Depth-Anything-V2/checkpoints/*.pt
 
 # Gradio
 .gradio/
+.dataset_cache/
+dataset/

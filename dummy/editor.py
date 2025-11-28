@@ -6,7 +6,7 @@ import numpy as np
 import gradio as gr
 from depth import compute_depth
 from segment import run_segmentation
-from editor import composite_with_depth
+from composite import composite_with_depth
 
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
