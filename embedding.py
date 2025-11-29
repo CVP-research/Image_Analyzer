@@ -8,6 +8,7 @@ from typing import List, Dict
 from pathlib import Path
 import pickle
 
+from utils import compute_dataset_hash
 
 class EmbeddingManager:
     """텍스트 임베딩 및 유사도 계산 관리 클래스"""
@@ -125,7 +126,6 @@ class EmbeddingManager:
         Returns:
             {폴더_경로: 임베딩} 딕셔너리
         """
-        from utils import compute_dataset_hash
         
         # 캐시 확인
         if use_cache and self.folder_cache_file.exists():

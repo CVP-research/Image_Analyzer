@@ -2,6 +2,7 @@
 import numpy as np
 import cv2
 from transformers import pipeline
+import colorsys
 
 # Segment model (GPU)
 seg_pipe = pipeline(
@@ -12,7 +13,6 @@ seg_pipe = pipeline(
 
 # Distinct colors
 def generate_distinct_colors(n=100):
-    import colorsys
     colors = []
     for i in range(n):
         hue = (i * 137.508) % 360

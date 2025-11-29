@@ -11,7 +11,7 @@ import torch
 
 from segment import run_segmentation
 from embedding import EmbeddingManager
-from utils import get_image_cache_key
+from utils import get_image_cache_key, find_all_images
 import pickle
 
 
@@ -229,7 +229,6 @@ class SemanticMatcher:
                                 break
         else:
             # 대분류 없으면 전체 디렉토리 스캔
-            from utils import find_all_images
             
             print(f"\n[Processing] Scanning all images in {dataset_dir}...")
             all_images = find_all_images(dataset_dir, use_cache=True, cache_dir=self.cache_dir)
