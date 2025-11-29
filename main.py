@@ -17,23 +17,26 @@ Few-shot Semantic Compositing Pipeline - Main Entry Point
 - semantic_matcher.py: 의미론적 배경 매칭
 """
 
+import hashlib
+import os
 import random
+import sys
 import time
 from pathlib import Path
-from PIL import Image
-import numpy as np
-from typing import List, Dict, Tuple
-import os
-import base64
+from typing import Dict, List, Tuple
+
 import cv2
+import numpy as np
+from PIL import Image
 from ultralytics import SAM
 
 from google import genai
 from google.genai import types
 
 from semantic_matcher import SemanticMatcher
-from composite import composite_on_segment
-
+from composite import composite_on_segment, compute_segment_averaged_depth
+from utils import get_all_objects
+from depth import compute_depth
 
 # 전역 설정
 BASE_DIR = Path(__file__).resolve().parent
@@ -41,13 +44,16 @@ DATASET_DIR = BASE_DIR / "dataset" / "train"
 INPUT_DIR = BASE_DIR / "input"
 VIDEO_DIR = BASE_DIR / "output" / "video"
 OUTPUT_DIR = BASE_DIR / "output" / "dataset"
-MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames" # New
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True) # New
-# Generative AI 클라이언트 초기화 (인증은 환경 변수 또는 genai.configure()를 통해 외부에서 처리된다고 가정)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+SAM_MODEL = None
+
+# Generative AI 클라이언트 초기화
 try:
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"  # 자신의 GCP 프로젝트 ID로 변경
     client = genai.Client(
         vertexai=True,
         project="gen-lang-client-0127629302",
@@ -55,10 +61,10 @@ try:
     )
 except Exception as e:
     print(f"Error initializing Google Generative AI client: {e}")
-    client = None # 클라이언트 초기화 실패 시 None으로 설정
+    sys.exit(1)
 
 # Global variable for the SAM model to ensure it's loaded only once.
-SAM_MODEL = None
+
 
 def get_sam_model():
     """Loads and returns the SAM model, caching it globally."""
@@ -72,6 +78,7 @@ def get_sam_model():
 # ============================================================
 # Step 1: 입력 이미지에서 랜덤으로 3장 선택
 # ============================================================
+
 def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path]:
     """
     입력 이미지에서 N장을 랜덤으로 선택
@@ -94,21 +101,26 @@ def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path
         selected = random.sample(input_images, num_views)
         
     print(f"  Selected: {[img.name for img in selected]}")
+    selected.insert(0, INPUT_DIR / "input.png")
+    
     return selected
+
 
 
 # ============================================================
 # Step 2: Veo3로 360도 뷰 영상 생성
 # ============================================================
+
+
 def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
     """
-    Veo3 API를 호출하여 360도 뷰 영상 생성 (GCS 업로드 없이 로컬 이미지로 직접 호출)
+    Veo3 API를 호출하여 360도 뷰 영상 생성
 
     Args:
         selected_images: 선택된 로컬 이미지 경로 리스트
 
     Returns:
-        생성된 360도 영상 파일 경로 (로컬 저장)
+        생성된 360도 영상 파일 경로
     """
     print(f"\n[Step 2] Generating 360° video with Veo3 API...")
 
@@ -128,12 +140,14 @@ def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
         f"Duration: 5 seconds."
     )
 
-    selected_images.insert(0, INPUT_DIR / "input.png")
     print("  Calling Veo API... This may take a while...")
-    reference_images = [types.VideoGenerationReferenceImage(
-                        image=types.Image.from_file(location=str(file)),
-                        reference_type="asset",
-                    ) for file in selected_images]
+    reference_images = [
+        types.VideoGenerationReferenceImage(
+            image=types.Image.from_file(location=str(file)),
+            reference_type="asset",
+        )
+        for file in selected_images
+    ]
     
     try:
         operation = client.models.generate_videos(
@@ -147,11 +161,11 @@ def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
 
         # Poll until done
         while not operation.done:
-            print("  Waiting for video generation...")
+            print("Waiting for video generation...")
             time.sleep(15)
             operation = client.operations.get(operation)
 
-        print("  ✓ Video generation completed!")
+        print("✓ Video generation completed!")
         print(operation.response)
         print(operation.result)
         if operation.response and operation.result.generated_videos:
@@ -161,12 +175,12 @@ def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
             with open(local_path, "wb") as f:
                 f.write(video_bytes)
 
-            print(f"  ✓ Saved generated video locally: {local_path}")
+            print(f"✓ Saved generated video locally: {local_path}")
             return local_path
 
 
     except Exception as e:
-        print(f"  Veo API Exception: {e}")
+        print(f"Veo API Exception: {e}")
         raise e
 
 
@@ -178,10 +192,6 @@ def frame_from_video(video_path: Path, output_dir: Path) -> None:
         video_path: Veo3에서 생성된 360도 영상 파일 경로
         output_dir: 분리된 프레임 저장 디렉토리 경로
     """
-    import cv2
-    import numpy as np
-    import hashlib
-
     print(f"\n[Frame Extraction] Extracting unique frames from video: {video_path.name}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -209,14 +219,16 @@ def frame_from_video(video_path: Path, output_dir: Path) -> None:
         saved_idx += 1
 
     cap.release()
-    print(f"  ✓ Extracted {saved_idx} unique frames to {output_dir}")
+    print(f"✓ Extracted {saved_idx} unique frames to {output_dir}")
 
 
 
 # ============================================================
 # Step 3: 객체만 segmentation
 # ============================================================
-def segment_objects(frame_dir: Path) -> None: # Modified return type
+
+
+def segment_objects(frame_dir: Path) -> None:
     """
     Segments the main object from each frame in a directory and saves them to MASKED_FRAMES_DIR.
 
@@ -230,7 +242,7 @@ def segment_objects(frame_dir: Path) -> None: # Modified return type
     frames = sorted([p for p in frame_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
 
     if not frames:
-        print(f"  Warning: No frames found in {frame_dir} to segment.")
+        print(f"Warning: No frames found in {frame_dir} to segment.")
         return
 
     for idx, frame_path in enumerate(frames):
@@ -272,62 +284,8 @@ def segment_objects(frame_dir: Path) -> None: # Modified return type
 
         out_path = MASKED_FRAMES_DIR / f"{frame_path.stem}_masked.png"
         rgba_pil.save(out_path)
-        print(f"  ✓ Segmented and saved: {out_path.name}")
-    print(f"  Completed segmentation of {len(frames)} frames.")
-
-
-def get_all_objects() -> List[Tuple[Image.Image, Dict]]:
-    """
-    Loads all segmented object images from MASKED_FRAMES_DIR and original input
-    images from INPUT_DIR, returning them with metadata.
-
-    Returns:
-        A list of tuples, where each tuple contains an object image (PIL RGBA)
-        and its metadata.
-    """
-    objects = []
-    
-    # Load from MASKED_FRAMES_DIR (segmented video frames)
-    print(f"\n[Step 3c] Loading segmented frames from {MASKED_FRAMES_DIR}...")
-    masked_files = sorted([p for p in MASKED_FRAMES_DIR.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
-    
-    for idx, file_path in enumerate(masked_files):
-        try:
-            img = Image.open(file_path).convert("RGBA")
-            metadata = {
-                "frame_idx": idx,
-                "category": "object", # Assuming all are objects
-                "filename": file_path.name
-            }
-            objects.append((img, metadata))
-            print(f"  Loaded masked frame: {file_path.name}")
-        except Exception as e:
-            print(f"  [WARN] Could not load masked frame {file_path.name}: {e}")
-
-    # Load from INPUT_DIR (original input images, assumed to be pre-masked or objects)
-    print(f"\n[Step 3d] Loading original input images from {INPUT_DIR}...")
-    original_files = sorted([p for p in INPUT_DIR.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
-    
-    start_idx = len(objects) # Continue indexing from where masked_files left off
-
-    for i, file_path in enumerate(original_files):
-        try:
-            img = Image.open(file_path).convert("RGBA")
-            metadata = {
-                "frame_idx": start_idx + i,
-                "category": "object", # Assuming all are objects
-                "filename": file_path.name
-            }
-            objects.append((img, metadata))
-            print(f"  Loaded original input image: {file_path.name}")
-        except Exception as e:
-            print(f"  [WARN] Could not load original input image {file_path.name}: {e}")
-            
-    if not objects:
-        print("  Warning: No objects were loaded from any directory.")
-        
-    return objects
-
+        print(f"✓ Segmented and saved: {out_path.name}")
+    print(f"Completed segmentation of {len(frames)} frames.")
 
 # ============================================================
 # Step 4: 의미론적으로 적합한 배경 위치 찾기 [IMPLEMENTED]
@@ -341,7 +299,7 @@ def find_suitable_backgrounds(
     max_workers: int = 5
 ) -> List[Dict]:
     """
-    [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
+    의미론적으로 적합한 배경 위치 찾기
     
     Args:
         object_category: 객체 카테고리
@@ -355,8 +313,8 @@ def find_suitable_backgrounds(
         배경 정보 리스트 [{"bg_image": Image, "segment_mask": np.ndarray, ...}]
     """
     print(f"\n[Step 4] Finding semantically suitable backgrounds...")
-    print(f"  Object category: {object_category}")
-    print(f"  Semantic locations: {semantic_locations}")
+    print(f"Object category: {object_category}")
+    print(f"Semantic locations: {semantic_locations}")
     if broad_categories:
         print(f"  Broad categories: {broad_categories}")
     
@@ -373,7 +331,7 @@ def find_suitable_backgrounds(
     # 캐시 저장
     matcher.embedding_manager.save_label_cache()
     
-    print(f"  Found {len(suitable_backgrounds)} suitable backgrounds")
+    print(f"Found {len(suitable_backgrounds)} suitable backgrounds")
     return suitable_backgrounds
 
 
@@ -408,8 +366,6 @@ def composite_naturally(
         - [TODO] Color harmonization
         - [TODO] Edge blending
     """
-    from depth import compute_depth
-    from composite import compute_segment_averaged_depth
     
     print(f"\n[Step 5] Compositing objects naturally...")
     print(f"  Use depth: {use_depth}")
@@ -439,12 +395,14 @@ def composite_naturally(
             averaged_depth_map = compute_segment_averaged_depth(bg_depth_map, segments)
             
             # 평균화된 depth map 시각화 및 저장
-            depth_vis_avg = ((averaged_depth_map - averaged_depth_map.min()) / 
-                           (averaged_depth_map.max() - averaged_depth_map.min() + 1e-8) * 255).astype(np.uint8)
-            depth_avg_filename = f"depth_averaged_bg{bg_idx}.png"
-            depth_avg_path = OUTPUT_DIR / depth_avg_filename
-            Image.fromarray(depth_vis_avg, mode='L').save(depth_avg_path)
-            print(f"    Saved averaged depth map: {depth_avg_filename}")
+            # depth_vis_avg = (
+            #     (averaged_depth_map - averaged_depth_map.min()) / 
+            #     (averaged_depth_map.max() - averaged_depth_map.min() + 1e-8) * 255
+            # ).astype(np.uint8)
+            # depth_avg_filename = f"depth_averaged_bg{bg_idx}.png"
+            # depth_avg_path = OUTPUT_DIR / depth_avg_filename
+            # Image.fromarray(depth_vis_avg, mode='L').save(depth_avg_path)
+            # print(f"Saved averaged depth map: {depth_avg_filename}")
         
         for obj_idx, (obj_image, obj_meta) in enumerate(objects):
             try:
@@ -461,28 +419,34 @@ def composite_naturally(
                 
                 # 저장
                 depth_suffix = "_depth" if use_depth else ""
-                output_filename = f"composite_bg{bg_idx}_obj{obj_idx}_{bg_info['segment_label'].replace(' ', '_')}{depth_suffix}.png"
+                output_filename = (
+                    f"composite_bg{bg_idx}_obj{obj_idx}_"
+                    f"{bg_info['segment_label'].replace(' ', '_')}{depth_suffix}.png"
+                )
                 output_path = OUTPUT_DIR / output_filename
                 result.save(output_path)
                 output_paths.append(output_path)
                 
-                print(f"  ✓ Saved: {output_filename}")
+                print(f"✓ Saved: {output_filename}")
             
             except Exception as e:
-                print(f"  ✗ Error: bg{bg_idx} + obj{obj_idx}: {e}")
+                print(f"✗ Error: bg{bg_idx} + obj{obj_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
     
-    print(f"  Generated {len(output_paths)} composite images")
+    print(f"Generated {len(output_paths)} composite images")
     return output_paths
+
+
 
 
 # ============================================================
 # 전체 파이프라인 실행 함수
 # ============================================================
+
+
 def run_full_pipeline(
-    input_dir: Path = INPUT_DIR,
     object_category: str = "object",
     semantic_locations: List[str] = None,
     broad_categories: List[str] = None,
@@ -498,7 +462,6 @@ def run_full_pipeline(
     전체 파이프라인을 순차적으로 실행
     
     Args:
-        input_dir: 입력 이미지 디렉토리
         object_category: 객체 카테고리
         semantic_locations: 의미론적 위치 리스트
         broad_categories: 대분류 카테고리 리스트
@@ -518,9 +481,12 @@ def run_full_pipeline(
     print("=" * 60)
     
     # Step 1: 입력 이미지 로드
-    input_images = list(input_dir.glob("*.png")) + list(input_dir.glob("*.jpg"))
+    input_images = (
+        list(INPUT_DIR.glob("*.png")) +
+        list(INPUT_DIR.glob("*.jpg"))
+    )
     if len(input_images) == 0:
-        print(f"Error: No images found in {input_dir}")
+        print(f"Error: No images found in {INPUT_DIR}")
         return []
     print(f"Found {len(input_images)} input images")
     
@@ -551,13 +517,17 @@ def run_full_pipeline(
         print("Error: No suitable backgrounds found!")
         return []
     
-    objects = get_all_objects()
+    objects = get_all_objects(
+        original_input_dir=INPUT_DIR,
+        masked_frames_dir=MASKED_FRAMES_DIR
+    )
 
     # Step 5: 자연스러운 합성
     output_paths = composite_naturally(
         objects=objects,
         backgrounds=backgrounds,
         use_depth=use_depth,
+        
         use_lighting=use_lighting,
         overlay_scale=overlay_scale,
         depth_offset=0.05  # overlay를 segment보다 5% 앞에 배치
@@ -576,14 +546,14 @@ def main():
     메인 엔트리 포인트
     
     전체 파이프라인:
-    1. [IMPLEMENTED] 입력 이미지 중 랜덤으로 3장 선택
+    1. [TODO] 입력 이미지에서 가장 좋은 3장 선택
     2. [IMPLEMENTED] Veo3로 360도 뷰 영상 생성 (시뮬레이션)
     3. [IMPLEMENTED] 객체만 segmentation
     4. [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
     5. [TODO] 자연스러운 합성 (depth, lighting)
     """
     print("=== Few-shot Semantic Compositing Pipeline ===")
-    print("[IMPLEMENTED] Step 1: Select 3 random views from input images")
+    print("[TODO] Step 1: Select 3 appropriate views from input images")
     print("[IMPLEMENTED] Step 2: Generate 360° video with Veo3 (Simulated)")
     print("[IMPLEMENTED] Step 3: Segment objects from video")
     print("[IMPLEMENTED] Step 4: Find semantically suitable backgrounds")
@@ -592,7 +562,6 @@ def main():
     
     # 전체 파이프라인 실행
     results = run_full_pipeline(
-        input_dir=INPUT_DIR,
         object_category="monkey doll",
         semantic_locations=["shelf", "bed", "couch", "table", "toy box"],
         broad_categories=["home", "indoor", "living room", "bedroom", "house interior"],

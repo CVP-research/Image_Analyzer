@@ -6,7 +6,8 @@ import os
 import hashlib
 import pickle
 from pathlib import Path
-from typing import List
+from PIL import Image
+from typing import List, Dict, Tuple
 
 
 def compute_dataset_hash(directory: Path) -> str:
@@ -113,3 +114,55 @@ def save_cache(cache_file: Path, data: dict):
             pickle.dump(data, f)
     except Exception as e:
         print(f"Warning: Failed to save cache: {e}")
+
+def get_all_objects(original_input_dir: Path, masked_frames_dir: Path) -> List[Tuple[Image.Image, Dict]]:
+    """
+    Loads all segmented object images from MASKED_FRAMES_DIR and original input
+    images from INPUT_DIR, returning them with metadata.
+
+    Returns:
+        A list of tuples, where each tuple contains an object image (PIL RGBA)
+        and its metadata.
+    """
+    objects = []
+    
+    # Load from MASKED_FRAMES_DIR (segmented video frames)
+    print(f"\n[Step 3c] Loading segmented frames from {masked_frames_dir}...")
+    masked_files = sorted([p for p in masked_frames_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+    
+    for idx, file_path in enumerate(masked_files):
+        try:
+            img = Image.open(file_path).convert("RGBA")
+            metadata = {
+                "frame_idx": idx,
+                "category": "object", # Assuming all are objects
+                "filename": file_path.name
+            }
+            objects.append((img, metadata))
+            print(f"  Loaded masked frame: {file_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not load masked frame {file_path.name}: {e}")
+
+    # Load from INPUT_DIR (original input images, assumed to be pre-masked or objects)
+    print(f"\n[Step 3d] Loading original input images from {original_input_dir}...")
+    original_files = sorted([p for p in original_input_dir.iterdir() if p.suffix.lower() in [".png", ".jpg", ".jpeg"]])
+    
+    start_idx = len(objects) # Continue indexing from where masked_files left off
+
+    for i, file_path in enumerate(original_files):
+        try:
+            img = Image.open(file_path).convert("RGBA")
+            metadata = {
+                "frame_idx": start_idx + i,
+                "category": "object", # Assuming all are objects
+                "filename": file_path.name
+            }
+            objects.append((img, metadata))
+            print(f"  Loaded original input image: {file_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not load original input image {file_path.name}: {e}")
+            
+    if not objects:
+        print("  Warning: No objects were loaded from any directory.")
+        
+    return objects
