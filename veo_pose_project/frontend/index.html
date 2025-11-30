@@ -1,0 +1,226 @@
+﻿<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Camera Pose Registration Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+            background: #1a1a1a;
+            color: #fff;
+        }
+
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+
+        #image-preview {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            width: 300px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 2px solid #4CAF50;
+            z-index: 100;
+        }
+
+        #current-image {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            display: block;
+        }
+
+        #image-info {
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+
+        .status {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 0, 0, 0.8);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            z-index: 100;
+        }
+
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            margin: 5px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+
+        #upload-section {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.9);
+            padding: 40px;
+            border-radius: 12px;
+            text-align: center;
+            z-index: 200;
+        }
+
+        #file-input {
+            display: none;
+        }
+
+        .upload-btn {
+            background: #2196F3;
+            font-size: 18px;
+            padding: 16px 32px;
+        }
+
+        .upload-btn:hover {
+            background: #0b7dda;
+        }
+
+        #instructions {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 13px;
+            max-width: 250px;
+            z-index: 100;
+        }
+
+        #instructions h3 {
+            margin-bottom: 10px;
+            color: #4CAF50;
+        }
+
+        #instructions ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        #instructions li {
+            margin: 5px 0;
+            padding-left: 20px;
+            position: relative;
+        }
+
+        #instructions li:before {
+            content: "▹";
+            position: absolute;
+            left: 0;
+            color: #4CAF50;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        #progress-bar {
+            margin-top: 10px;
+            height: 8px;
+            background: #333;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        #progress-fill {
+            height: 100%;
+            background: #4CAF50;
+            width: 0%;
+            transition: width 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div id="canvas-container"></div>
+
+    <div id="upload-section">
+        <h2>3D Camera Pose Registration Tool</h2>
+        <p style="margin: 20px 0;">이미지를 업로드하여 시작하세요</p>
+        <input type="file" id="file-input" multiple accept="image/*">
+        <button class="upload-btn" onclick="document.getElementById('file-input').click()">
+            이미지 선택
+        </button>
+        <button class="upload-btn" onclick="loadExistingPoses()" style="background: #FF9800;">
+            기존 포즈 불러오기
+        </button>
+    </div>
+
+    <div id="image-preview" class="hidden">
+        <img id="current-image" src="" alt="Current Image">
+        <div id="image-info">
+            <div>이미지: <span id="current-filename" class="status">-</span></div>
+            <div>진행: <span id="progress-text" class="status">0/0</span></div>
+        </div>
+        <div id="progress-bar">
+            <div id="progress-fill"></div>
+        </div>
+    </div>
+
+    <div id="instructions" class="hidden">
+        <h3>사용법</h3>
+        <ul>
+            <li>마우스로 3D 구 회전</li>
+            <li>원하는 시점 찾기</li>
+            <li><strong>Space/Enter</strong>: 포즈 저장</li>
+            <li>모든 이미지 완료 시 자동 저장</li>
+        </ul>
+    </div>
+
+    <div id="controls" class="hidden">
+        <button id="capture-btn" onclick="captureCurrentPose()">
+            현재 포즈 등록 (Space/Enter)
+        </button>
+        <button onclick="skipImage()">건너뛰기</button>
+        <button onclick="savePoses()" style="background: #FF9800;">저장 & 다운로드</button>
+        <button onclick="resetAll()" style="background: #f44336;">초기화</button>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module" src="/static/app.js"></script>
+</body>
+</html>
