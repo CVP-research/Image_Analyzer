@@ -13,7 +13,7 @@ if REPO_ROOT.exists() and str(REPO_ROOT) not in sys.path:
 from depth_anything_v2.dpt import DepthAnythingV2
 
 # Depth 모델 설정
-ENCODER = "vits"
+ENCODER = "vitb"
 INPUT_SIZE = 518
 
 depth_model_configs = {
