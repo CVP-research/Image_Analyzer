@@ -1,6 +1,11 @@
 import hashlib
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# Add parent directory to path for module imports
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
 
 import cv2
 import numpy as np
@@ -11,9 +16,6 @@ from composite import composite_on_segment, compute_segment_averaged_depth
 from depth import compute_depth
 from semantic_matcher import SemanticMatcher
 from utils import get_all_objects
-
-
-BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "dataset" / "train"
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output" / "dataset"
@@ -285,25 +287,45 @@ def composite_naturally(
     return output_paths
 
 
-def run_test_from_video():
-    """Run the pipeline starting from an existing video (monkey.mp4)."""
+def run_test_from_video(
+    video_path: Path = None,
+    object_category: str = "object",
+    semantic_locations: List[str] = None,
+    broad_categories: List[str] = None,
+):
+    """Run the pipeline starting from an existing video.
+    
+    Args:
+        video_path: Path to the video file. If None, uses masked frames if available.
+        object_category: Object category name for background matching.
+        semantic_locations: List of semantic locations to search for backgrounds.
+        broad_categories: List of broad categories to filter backgrounds.
+    """
+    if semantic_locations is None:
+        semantic_locations = ["shelf", "bed", "couch", "table", "toy box"]
+    if broad_categories is None:
+        broad_categories = ["home", "indoor", "living room", "bedroom", "house interior"]
+    
     existing_masks = sorted(MASKED_FRAMES_DIR.glob("*.png"))
     if existing_masks:
         print(f"Found {len(existing_masks)} masked frame(s). Skipping video extraction and segmentation.")
     else:
-        video_path = BASE_DIR / "monkey.mp4"
+        if video_path is None:
+            print("No video path provided and no existing masked frames found.")
+            print("Please provide a video path or place masked frames in the output directory.")
+            return
         if not video_path.exists():
             print(f"Video not found: {video_path}")
             return
 
-        frames_dir = OUTPUT_DIR / "monkey_frames"
+        frames_dir = OUTPUT_DIR / f"{video_path.stem}_frames"
         frame_from_video(video_path, frames_dir)
         segment_objects(frames_dir)
 
     backgrounds = find_suitable_backgrounds(
-        object_category="monkey doll",
-        semantic_locations=["shelf", "bed", "couch", "table", "toy box"],
-        broad_categories=["home", "indoor", "living room", "bedroom", "house interior"],
+        object_category=object_category,
+        semantic_locations=semantic_locations,
+        broad_categories=broad_categories,
         max_backgrounds=5,
         similarity_threshold=0.8,
         max_workers=5,
