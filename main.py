@@ -336,6 +336,55 @@ def find_suitable_backgrounds(
 
 
 # ============================================================
+# Poisson blending helper
+# ============================================================
+def blend_object(obj_image: Image.Image, bg_image: Image.Image) -> Image.Image:
+    """
+    Perform Poisson (seamless) blending of an object image onto a background.
+    The object is centered via mask centroid when available.
+    """
+    obj_rgba = obj_image.convert("RGBA")
+    bg_rgba = bg_image.convert("RGBA")
+
+    obj_cv = cv2.cvtColor(np.array(obj_rgba), cv2.COLOR_RGBA2BGRA)
+    bg_cv = cv2.cvtColor(np.array(bg_rgba), cv2.COLOR_RGBA2BGRA)
+
+    # Resize object only if larger than background
+    bg_h, bg_w = bg_cv.shape[:2]
+    obj_h, obj_w = obj_cv.shape[:2]
+    if obj_w > bg_w or obj_h > bg_h:
+        scale = min(bg_w / obj_w, bg_h / obj_h) * 0.9
+        obj_cv = cv2.resize(obj_cv, (int(obj_w * scale), int(obj_h * scale)), interpolation=cv2.INTER_AREA)
+        obj_h, obj_w = obj_cv.shape[:2]
+
+    # Mask: alpha if present, else non-zero RGB
+    if obj_cv.shape[2] == 4:
+        mask = obj_cv[:, :, 3]
+    else:
+        mask = cv2.cvtColor(obj_cv, cv2.COLOR_BGR2GRAY)
+    _, mask_bin = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
+
+    # Position: mask centroid if available, else center
+    M = cv2.moments(mask_bin)
+    if M["m00"] != 0:
+        cX = int(M["m10"] / M["m00"])
+        cY = int(M["m01"] / M["m00"])
+        center = (cX, cY)
+    else:
+        center = (bg_w // 2, bg_h // 2)
+
+    blended = cv2.seamlessClone(
+        obj_cv[:, :, :3],           # src BGR
+        bg_cv[:, :, :3],            # dst BGR
+        mask_bin,                   # mask uint8
+        center,                     # center point
+        cv2.MIXED_CLONE
+    )
+
+    return Image.fromarray(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB))
+
+
+# ============================================================
 # Step 5: 자연스러운 합성
 # ============================================================
 def composite_naturally(
@@ -407,7 +456,7 @@ def composite_naturally(
         for obj_idx, (obj_image, obj_meta) in enumerate(objects):
             try:
                 # 합성 (평균화된 depth map 사용)
-                result = composite_on_segment(
+                composite_img = composite_on_segment(
                     bg_info["bg_image"],
                     bg_info["segment_mask"],
                     obj_image,
@@ -417,17 +466,35 @@ def composite_naturally(
                     depth_offset=depth_offset
                 )
                 
-                # 저장
+                # Composite vs background diff -> object mask -> Poisson blend
+                bg_rgb = bg_info["bg_image"].convert("RGB")
+                comp_rgb = composite_img.convert("RGB")
+
+                bg_cv = cv2.cvtColor(np.array(bg_rgb), cv2.COLOR_RGB2BGR)
+                comp_cv = cv2.cvtColor(np.array(comp_rgb), cv2.COLOR_RGB2BGR)
+
+                diff_gray = cv2.cvtColor(cv2.absdiff(comp_cv, bg_cv), cv2.COLOR_BGR2GRAY)
+                _, obj_mask = cv2.threshold(diff_gray, 1, 255, cv2.THRESH_BINARY)
+
+                if obj_mask.max() == 0:
+                    blended_img = composite_img  # fallback if mask is empty
+                else:
+                    obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
+                    obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
+                    obj_only_rgba[:, :, 3] = obj_mask
+                    obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
+                    blended_img = blend_object(obj_cutout, bg_info["bg_image"])
+                
                 depth_suffix = "_depth" if use_depth else ""
                 output_filename = (
                     f"composite_bg{bg_idx}_obj{obj_idx}_"
                     f"{bg_info['segment_label'].replace(' ', '_')}{depth_suffix}.png"
                 )
                 output_path = OUTPUT_DIR / output_filename
-                result.save(output_path)
+                blended_img.save(output_path)
                 output_paths.append(output_path)
                 
-                print(f"✓ Saved: {output_filename}")
+                print(f"??Saved: {output_filename}")
             
             except Exception as e:
                 print(f"✗ Error: bg{bg_idx} + obj{obj_idx}: {e}")
