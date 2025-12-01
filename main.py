@@ -22,6 +22,8 @@ import os
 import random
 import sys
 import time
+import json
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -48,6 +50,7 @@ MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+POSES_FILE = BASE_DIR.parent / "backend" / "camera_poses.json"
 
 SAM_MODEL = None
 
@@ -75,35 +78,164 @@ def get_sam_model():
         print("SAM model loaded.")
     return SAM_MODEL
 
+
+def load_camera_poses(path: Path) -> Dict[str, dict]:
+    """backend/camera_poses.json 로드"""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def compute_center(poses: Dict[str, dict]) -> List[float]:
+    """
+    모든 look_at의 평균을 '객체 중심'으로 사용.
+    (대부분 [0,0,0]일 가능성이 높지만, 일반화해서 계산)
+    """
+    xs, ys, zs = [], [], []
+    for p in poses.values():
+        lx, ly, lz = p["look_at"]
+        xs.append(lx); ys.append(ly); zs.append(lz)
+
+    n = len(xs) if xs else 1
+    return [sum(xs)/n, sum(ys)/n, sum(zs)/n]
+
+
+def circular_distance(a: float, b: float) -> float:
+    """원 위에서 두 각도의 차이를 0~180도 범위로 계산"""
+    d = abs(a - b) % 360.0
+    return min(d, 360.0 - d)
+
+
+def pick_best_3(
+    poses: Dict[str, dict],
+    elevation_limit: float = 60.0,
+    num_views: int = 3
+):
+    """
+    포즈들로부터 '좋은' 3장 선택
+    - elevation 너무 큰 건 제외 (탑뷰/바닥뷰 제거)
+    - 정면(azimuth≈0°) 1장은 무조건 포함
+    - 나머지 2장은 수평 방향(azimuth)이 서로 최대한 멀리 떨어지게
+    """
+    center = compute_center(poses)
+    cx, cy, cz = center
+
+    view_infos = []
+    for filename, p in poses.items():
+        px, py, pz = p["position"]
+
+        # 객체 중심 기준 위치 벡터
+        vx, vy, vz = px - cx, py - cy, pz - cz
+        r = math.sqrt(vx*vx + vy*vy + vz*vz) + 1e-8
+
+        # 수평각(azimuth), 수직각(elevation)
+        azimuth = math.degrees(math.atan2(vx, vz))      # x-z 평면 기준
+        elevation = math.degrees(math.asin(vy / r))     # y 기준
+
+        view_infos.append({
+            "filename": filename,
+            "azimuth": azimuth,
+            "elevation": elevation,
+            "distance": r,
+        })
+
+    # 1) elevation 필터: 너무 위/아래(예: > 60도)는 제거
+    filtered = [
+        v for v in view_infos
+        if abs(v["elevation"]) <= elevation_limit
+    ]
+    if len(filtered) < num_views:
+        # 필터링하고 남은 게 너무 적으면 그냥 다 씀
+        filtered = view_infos
+
+    # 2) 정면 찾기: azimuth 절대값이 최소인 뷰
+    front_view = min(filtered, key=lambda v: abs(v["azimuth"]))
+
+    # front를 뺀 나머지 후보들
+    remaining = [v for v in filtered if v is not front_view]
+
+    if len(remaining) <= 2:
+        chosen = [front_view] + remaining
+        chosen = chosen[:3]
+        chosen.sort(key=lambda v: v["azimuth"])
+        return chosen
+
+    # 3) 두 번째 뷰: front와 수평각이 가장 멀리 떨어진 뷰
+    second = max(
+        remaining,
+        key=lambda v: circular_distance(v["azimuth"], front_view["azimuth"])
+    )
+
+    # 4) 세 번째 뷰: front / second 양쪽과 모두 멀리 떨어진 뷰
+    remaining2 = [v for v in remaining if v is not second]
+
+    def score(v):
+        return min(
+            circular_distance(v["azimuth"], front_view["azimuth"]),
+            circular_distance(v["azimuth"], second["azimuth"])
+        )
+
+    third = max(remaining2, key=score)
+
+    chosen = [front_view, second, third]
+    chosen.sort(key=lambda v: v["azimuth"])
+    return chosen
+
 # ============================================================
 # Step 1: 입력 이미지에서 랜덤으로 3장 선택
 # ============================================================
 
+# ============================================================
+# Step 1: 카메라 포즈를 이용해서 "좋은" 3장 선택
+# ============================================================
 def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path]:
     """
-    입력 이미지에서 N장을 랜덤으로 선택
-    
-    [TODO] 추후 이미지 품질, 객체 가시성, 다양성을 고려한 뷰 선택 알고리즘으로 교체
-    
-    Args:
-        input_images: 입력 이미지 경로 리스트
-        num_views: 선택할 이미지 개수
-    
-    Returns:
-        선택된 이미지 경로 리스트
+    camera_poses.json에 저장된 카메라 포즈 정보를 사용해서
+    - 너무 위/아래에서 찍힌 샷(elevation 큰 것)은 제외하고
+    - 정면(azimuth≈0°) 1장을 무조건 포함시키고
+    - 나머지 2장은 수평각(azimuth)이 서로 최대한 벌어지도록 선택
+
+    만약 포즈 파일이 없거나 문제 있으면, 이전처럼 랜덤 3장으로 fallback.
     """
-    print(f"\n[Step 1] Selecting {num_views} random views from {len(input_images)} images...")
-    
-    if len(input_images) <= num_views:
-        print("  Number of images is less than or equal to num_views. Using all images.")
-        selected = input_images
-    else:
-        selected = random.sample(input_images, num_views)
-        
-    print(f"  Selected: {[img.name for img in selected]}")
-    selected.insert(0, INPUT_DIR / "input.png")
-    
-    return selected
+    print(f"\n[Step 1] Selecting {num_views} best views from {len(input_images)} images using camera poses...")
+
+    # 1) 포즈 JSON 로드
+    if not POSES_FILE.exists():
+        print(f"  [WARN] {POSES_FILE} not found. Falling back to random selection.")
+        if len(input_images) <= num_views:
+            return input_images
+        return random.sample(input_images, num_views)
+
+    poses = load_camera_poses(POSES_FILE)
+    if not poses:
+        print("  [WARN] No poses found in camera_poses.json. Falling back to random selection.")
+        if len(input_images) <= num_views:
+            return input_images
+        return random.sample(input_images, num_views)
+
+    # 2) 포즈 기반으로 '좋은 3장' 선택 (정면 포함 로직)
+    chosen = pick_best_3(poses, elevation_limit=60.0, num_views=num_views)
+    chosen_filenames = [v["filename"] for v in chosen]
+    print("  Chosen filenames (from poses):", chosen_filenames)
+
+    # 3) 파일 이름 -> 실제 Path로 매핑
+    name_to_path = {p.name: p for p in input_images}
+    selected_paths: List[Path] = []
+    for name in chosen_filenames:
+        if name in name_to_path:
+            selected_paths.append(name_to_path[name])
+        else:
+            print(f"  [WARN] Pose exists for {name} but file not found in INPUT_DIR.")
+
+    # 4) 혹시 3장 다 못 찾았으면, 나머지는 랜덤으로 채우기
+    if len(selected_paths) < num_views:
+        print(f"  [INFO] Only {len(selected_paths)} matched. Filling the rest randomly.")
+        remaining = [p for p in input_images if p not in selected_paths]
+        extra = random.sample(remaining, min(num_views - len(selected_paths), len(remaining)))
+        selected_paths.extend(extra)
+
+    print(f"  Final selected views: {[p.name for p in selected_paths]}")
+    return selected_paths
+
 
 
 
