@@ -59,7 +59,7 @@ try:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "credentials.json"  # 자신의 GCP 프로젝트 ID로 변경
     client = genai.Client(
         vertexai=True,
-        project="gen-lang-client-0127629302",
+        project="kinetic-cosmos-479912-s0",
         location="us-central1"
     )
 except Exception as e:
