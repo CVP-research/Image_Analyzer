@@ -1,11 +1,19 @@
+import argparse
 import hashlib
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PIL import Image
 from ultralytics import SAM
+
+# Add parent directory to sys.path for imports from the main project
+TEST_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = TEST_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from composite import composite_on_segment, compute_segment_averaged_depth
 from depth import compute_depth
@@ -13,11 +21,15 @@ from semantic_matcher import SemanticMatcher
 from utils import get_all_objects
 
 
-BASE_DIR = Path(__file__).resolve().parent
+# Project directories (relative to project root, not test folder)
+BASE_DIR = PROJECT_ROOT
 DATASET_DIR = BASE_DIR / "dataset" / "train"
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output" / "dataset"
 MASKED_FRAMES_DIR = OUTPUT_DIR / "masked_frames"
+
+# Default video path (in test folder)
+DEFAULT_VIDEO_PATH = TEST_DIR / "monkey.mp4"
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
@@ -285,18 +297,29 @@ def composite_naturally(
     return output_paths
 
 
-def run_test_from_video():
-    """Run the pipeline starting from an existing video (monkey.mp4)."""
+def run_test_from_video(video_path: Optional[Path] = None):
+    """
+    Run the pipeline starting from an existing video.
+
+    Args:
+        video_path: Path to the video file. If None, uses the default monkey.mp4.
+    """
+    if video_path is None:
+        video_path = DEFAULT_VIDEO_PATH
+    else:
+        video_path = Path(video_path).resolve()
+
     existing_masks = sorted(MASKED_FRAMES_DIR.glob("*.png"))
     if existing_masks:
         print(f"Found {len(existing_masks)} masked frame(s). Skipping video extraction and segmentation.")
     else:
-        video_path = BASE_DIR / "monkey.mp4"
         if not video_path.exists():
             print(f"Video not found: {video_path}")
             return
 
-        frames_dir = OUTPUT_DIR / "monkey_frames"
+        # Use video filename (without extension) as the frames directory name
+        video_name = video_path.stem
+        frames_dir = OUTPUT_DIR / f"{video_name}_frames"
         frame_from_video(video_path, frames_dir)
         segment_objects(frames_dir)
 
@@ -339,5 +362,22 @@ def run_test_from_video():
         print("\nNo composite images were generated.")
 
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Run image composition test pipeline from a video file."
+    )
+    parser.add_argument(
+        "--video",
+        "-v",
+        type=str,
+        default=None,
+        help=f"Path to the video file. Defaults to {DEFAULT_VIDEO_PATH}",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    run_test_from_video()
+    args = parse_args()
+    video_path = Path(args.video) if args.video else None
+    run_test_from_video(video_path=video_path)
