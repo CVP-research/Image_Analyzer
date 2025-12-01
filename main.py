@@ -50,7 +50,7 @@ MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-POSES_FILE = BASE_DIR.parent / "backend" / "camera_poses.json"
+POSES_FILE = BASE_DIR / "veo_pose_project" / "backend" / "camera_poses.json"
 
 SAM_MODEL = None
 
