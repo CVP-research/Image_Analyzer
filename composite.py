@@ -249,7 +249,7 @@ def composite_on_segment(
     use_depth: bool = False,
     bg_depth_map: np.ndarray = None,
     depth_offset: float = 0.05
-) -> Image.Image:
+) -> Tuple[Image.Image, float]:
     """
     Segment 영역에 오버레이 합성 - segment 크기에 맞춰 자동 스케일링
     
@@ -263,7 +263,7 @@ def composite_on_segment(
         depth_offset: overlay를 앞으로 당길 오프셋 (기본 0.05)
     
     Returns:
-        합성된 이미지
+        (합성된 이미지, occlusion 비율)
     """
     # Segment 영역 분석
     ys, xs = np.where(segment_mask)
@@ -306,6 +306,7 @@ def composite_on_segment(
     print(f"    Segment size: {segment_width}x{segment_height}, Auto scale: {auto_scale:.2f}, Center: ({center_x}, {center_y})")
     
     # 합성 (adaptive depth offset)
+    occlusion_ratio = 0.0
     if use_depth and bg_depth_map is not None:
         # 첫 시도: 기본 offset
         current_offset = depth_offset
@@ -338,4 +339,4 @@ def composite_on_segment(
             (center_x, center_y)
         )
     
-    return result
+    return result, occlusion_ratio

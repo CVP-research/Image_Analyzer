@@ -40,6 +40,76 @@ from composite import composite_on_segment, compute_segment_averaged_depth
 from utils import get_all_objects
 from depth import compute_depth
 
+
+# ============================================================
+# Option G: 밝기 + 색온도 조정 함수들
+# ============================================================
+def adjust_lighting_and_temperature(
+    obj_cv: np.ndarray, 
+    bg_cv: np.ndarray, 
+    mask_bin: np.ndarray,
+    brightness_strength: float = 0.3,
+    temperature_strength: float = 0.2
+) -> np.ndarray:
+    """
+    배경의 밝기와 색온도를 분석하여 객체에 적용 (고유 색상 유지)
+    
+    Args:
+        obj_cv: 객체 이미지 (BGR)
+        bg_cv: 배경 이미지 (BGR)
+        mask_bin: 객체 마스크
+        brightness_strength: 밝기 조정 강도 (0.3 = 30% 배경 밝기에 맞춤)
+        temperature_strength: 색온도 조정 강도 (0.2 = 20% 배경 색온도에 맞춤)
+    
+    Returns:
+        조정된 객체 이미지 (BGR)
+    """
+    # 1. 배경 밝기 분석 (Lab의 L 채널)
+    bg_lab = cv2.cvtColor(bg_cv, cv2.COLOR_BGR2LAB).astype(np.float32)
+    bg_brightness = np.mean(bg_lab[:, :, 0])  # L 채널 평균
+    
+    # 2. 배경 색온도 분석 (R-B 차이)
+    bg_r = np.mean(bg_cv[:, :, 2])  # Red
+    bg_b = np.mean(bg_cv[:, :, 0])  # Blue
+    bg_temperature = (bg_r - bg_b) / 255.0  # -1(차가움) ~ 1(따뜻함)
+    
+    # 3. 객체를 Lab으로 변환
+    obj_lab = cv2.cvtColor(obj_cv, cv2.COLOR_BGR2LAB).astype(np.float32)
+    
+    # 객체의 현재 밝기
+    obj_mask_bool = mask_bin > 0
+    if np.sum(obj_mask_bool) > 0:
+        obj_brightness = np.mean(obj_lab[:, :, 0][obj_mask_bool[:obj_lab.shape[0], :obj_lab.shape[1]]])
+    else:
+        obj_brightness = np.mean(obj_lab[:, :, 0])
+    
+    # 4. 밝기 조정 (Lab의 L 채널만)
+    brightness_diff = bg_brightness - obj_brightness
+    obj_lab[:, :, 0] = np.clip(
+        obj_lab[:, :, 0] + brightness_diff * brightness_strength,
+        0, 255
+    )
+    
+    # Lab → BGR 변환
+    obj_adjusted = cv2.cvtColor(obj_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    
+    # 5. 색온도 조정 (R, B 채널만 살짝)
+    if abs(bg_temperature) > 0.05:  # 배경이 확실히 따뜻하거나 차가울 때만
+        temperature_shift = bg_temperature * temperature_strength * 50  # -10 ~ 10 정도
+        
+        obj_adjusted[:, :, 2] = np.clip(
+            obj_adjusted[:, :, 2].astype(np.float32) + temperature_shift,
+            0, 255
+        ).astype(np.uint8)  # Red
+        
+        obj_adjusted[:, :, 0] = np.clip(
+            obj_adjusted[:, :, 0].astype(np.float32) - temperature_shift,
+            0, 255
+        ).astype(np.uint8)  # Blue
+    
+    return obj_adjusted
+
+
 # 전역 설정
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "dataset" / "train"
@@ -466,10 +536,25 @@ def find_suitable_backgrounds(
 # ============================================================
 # Poisson blending helper
 # ============================================================
-def blend_object(obj_image: Image.Image, bg_image: Image.Image) -> Image.Image:
+def blend_object(
+    obj_image: Image.Image, 
+    bg_image: Image.Image,
+    brightness_strength: float = 0.3,
+    temperature_strength: float = 0.2,
+    erode_iterations: int = 1
+) -> Image.Image:
     """
-    Perform Poisson (seamless) blending of an object image onto a background.
-    The object is centered via mask centroid when available.
+    Option G: 밝기 + 색온도 조정 + 순수 알파 블렌딩
+    
+    Args:
+        obj_image: 객체 이미지 (RGBA)
+        bg_image: 배경 이미지
+        brightness_strength: 밝기 조정 강도 (기본 30%)
+        temperature_strength: 색온도 조정 강도 (기본 20%)
+        erode_iterations: 마스크 침식 반복 횟수 (테두리 제거용)
+    
+    Returns:
+        합성된 이미지
     """
     obj_rgba = obj_image.convert("RGBA")
     bg_rgba = bg_image.convert("RGBA")
@@ -477,39 +562,57 @@ def blend_object(obj_image: Image.Image, bg_image: Image.Image) -> Image.Image:
     obj_cv = cv2.cvtColor(np.array(obj_rgba), cv2.COLOR_RGBA2BGRA)
     bg_cv = cv2.cvtColor(np.array(bg_rgba), cv2.COLOR_RGBA2BGRA)
 
-    # Resize object only if larger than background
     bg_h, bg_w = bg_cv.shape[:2]
     obj_h, obj_w = obj_cv.shape[:2]
+    
+    # 객체 리사이즈
     if obj_w > bg_w or obj_h > bg_h:
         scale = min(bg_w / obj_w, bg_h / obj_h) * 0.9
         obj_cv = cv2.resize(obj_cv, (int(obj_w * scale), int(obj_h * scale)), interpolation=cv2.INTER_AREA)
         obj_h, obj_w = obj_cv.shape[:2]
 
-    # Mask: alpha if present, else non-zero RGB
+    # 마스크 생성
     if obj_cv.shape[2] == 4:
         mask = obj_cv[:, :, 3]
     else:
         mask = cv2.cvtColor(obj_cv, cv2.COLOR_BGR2GRAY)
     _, mask_bin = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)
+    
+    # 마스크 침식: 테두리 픽셀 제거 (흰색/검은색 경계선 문제 해결)
+    if erode_iterations > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_bin = cv2.erode(mask_bin, kernel, iterations=erode_iterations)
+    
+    # 알파 채널 부드럽게 (경계 블렌딩)
+    mask_float = mask_bin.astype(np.float32) / 255.0
+    mask_float = cv2.GaussianBlur(mask_float, (3, 3), 0.5)
 
-    # Position: mask centroid if available, else center
-    M = cv2.moments(mask_bin)
-    if M["m00"] != 0:
-        cX = int(M["m10"] / M["m00"])
-        cY = int(M["m01"] / M["m00"])
-        center = (cX, cY)
-    else:
-        center = (bg_w // 2, bg_h // 2)
-
-    blended = cv2.seamlessClone(
-        obj_cv[:, :, :3],           # src BGR
-        bg_cv[:, :, :3],            # dst BGR
-        mask_bin,                   # mask uint8
-        center,                     # center point
-        cv2.MIXED_CLONE
+    # 밝기 + 색온도 조정
+    obj_adjusted = adjust_lighting_and_temperature(
+        obj_cv[:, :, :3], 
+        bg_cv[:, :, :3], 
+        (mask_float * 255).astype(np.uint8),
+        brightness_strength=brightness_strength,
+        temperature_strength=temperature_strength
     )
-
-    return Image.fromarray(cv2.cvtColor(blended, cv2.COLOR_BGR2RGB))
+    
+    # 순수 알파 블렌딩 (Poisson 제거)
+    result = bg_cv[:, :, :3].copy()
+    y_offset = (bg_h - obj_h) // 2
+    x_offset = (bg_w - obj_w) // 2
+    
+    for i in range(obj_h):
+        for j in range(obj_w):
+            alpha = mask_float[i, j]
+            if alpha > 0.01:  # 거의 투명한 픽셀 무시
+                by, bx = y_offset + i, x_offset + j
+                if 0 <= by < bg_h and 0 <= bx < bg_w:
+                    result[by, bx] = (
+                        obj_adjusted[i, j] * alpha + 
+                        result[by, bx] * (1 - alpha)
+                    ).astype(np.uint8)
+    
+    return Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB))
 
 
 # ============================================================
@@ -521,7 +624,9 @@ def composite_naturally(
     use_depth: bool = False,
     use_lighting: bool = False,
     overlay_scale: float = 1.0,
-    depth_offset: float = 0.05
+    depth_offset: float = 0.05,
+    objects_per_bg: int = 2,
+    occlusion_threshold: float = 0.3
 ) -> List[Path]:
     """
     객체를 배경에 자연스럽게 합성
@@ -530,34 +635,40 @@ def composite_naturally(
         objects: [(누끼 이미지, 메타데이터)] 리스트
         backgrounds: 배경 정보 리스트
         use_depth: Depth 기반 occlusion 사용 여부
-        use_lighting: Lighting 조정 사용 여부
+        use_lighting: Lighting 조정 사용 여부 (Option G 적용)
         overlay_scale: 오버레이 스케일
         depth_offset: overlay를 앞으로 당길 오프셋 (기본 0.05)
+        objects_per_bg: 배경당 합성할 객체 개수 (기본 2)
+        occlusion_threshold: 가려짐 비율 임계값 (0.3 = 30% 이상 가려지면 스킵)
     
     Returns:
         저장된 합성 이미지 경로 리스트
     
-    구현 가이드:
+    구현:
         - [IMPLEMENTED] Depth 기반 occlusion 처리
-        - [TODO] Lighting/shadow 조정
-        - [TODO] Color harmonization
-        - [TODO] Edge blending
+        - [IMPLEMENTED] Option G lighting 조정 (blend_object 함수에서 자동 적용)
+        - [IMPLEMENTED] 배경당 랜덤 객체 선택
+        - [IMPLEMENTED] 가려짐 비율 체크
     """
     
     print(f"\n[Step 5] Compositing objects naturally...")
     print(f"  Use depth: {use_depth}")
-    print(f"  Use lighting: {use_lighting}")
-    if use_lighting:
-        print("[TODO] Lighting adjustment not implemented yet")
+    print(f"  Use lighting: {use_lighting} (Option G: brightness + color temperature)")
+    print(f"  Objects per background: {objects_per_bg}")
+    print(f"  Occlusion threshold: {occlusion_threshold:.1%}")
     
     output_paths = []
     
     for bg_idx, bg_info in enumerate(backgrounds):
+        # 배경당 랜덤으로 객체 선택
+        selected_objects = random.sample(objects, min(objects_per_bg, len(objects)))
+        print(f"\n  Background {bg_idx}: Selected {len(selected_objects)} objects")
+        
         # Depth 계산 (use_depth=True일 때만)
         bg_depth_map = None
         averaged_depth_map = None
         if use_depth:
-            print(f"\n  Computing depth for background {bg_idx}...")
+            print(f"    Computing depth for background {bg_idx}...")
             _, bg_depth_map = compute_depth(bg_info["bg_image"])
             print(f"    Depth range: [{bg_depth_map.min():.2f}, {bg_depth_map.max():.2f}]")
             
@@ -570,21 +681,11 @@ def composite_naturally(
             
             # 평균화된 depth map 생성
             averaged_depth_map = compute_segment_averaged_depth(bg_depth_map, segments)
-            
-            # 평균화된 depth map 시각화 및 저장
-            # depth_vis_avg = (
-            #     (averaged_depth_map - averaged_depth_map.min()) / 
-            #     (averaged_depth_map.max() - averaged_depth_map.min() + 1e-8) * 255
-            # ).astype(np.uint8)
-            # depth_avg_filename = f"depth_averaged_bg{bg_idx}.png"
-            # depth_avg_path = OUTPUT_DIR / depth_avg_filename
-            # Image.fromarray(depth_vis_avg, mode='L').save(depth_avg_path)
-            # print(f"Saved averaged depth map: {depth_avg_filename}")
         
-        for obj_idx, (obj_image, obj_meta) in enumerate(objects):
+        for obj_idx, (obj_image, obj_meta) in enumerate(selected_objects):
             try:
-                # 합성 (평균화된 depth map 사용)
-                composite_img = composite_on_segment(
+                # 합성 (평균화된 depth map 사용) - occlusion_ratio도 반환받음
+                composite_img, occlusion_ratio = composite_on_segment(
                     bg_info["bg_image"],
                     bg_info["segment_mask"],
                     obj_image,
@@ -594,7 +695,14 @@ def composite_naturally(
                     depth_offset=depth_offset
                 )
                 
-                # Composite vs background diff -> object mask -> Poisson blend
+                # 가려짐이 임계값 이상이면 스킵
+                if occlusion_ratio >= occlusion_threshold:
+                    print(f"    ⊗ Object {obj_idx}: {occlusion_ratio:.1%} occluded (>= {occlusion_threshold:.1%}), skipping")
+                    continue
+                
+                print(f"    ✓ Object {obj_idx}: {occlusion_ratio:.1%} occluded, compositing...")
+                
+                # Composite vs background diff -> object mask
                 bg_rgb = bg_info["bg_image"].convert("RGB")
                 comp_rgb = composite_img.convert("RGB")
 
@@ -605,13 +713,15 @@ def composite_naturally(
                 _, obj_mask = cv2.threshold(diff_gray, 1, 255, cv2.THRESH_BINARY)
 
                 if obj_mask.max() == 0:
-                    blended_img = composite_img  # fallback if mask is empty
-                else:
-                    obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
-                    obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
-                    obj_only_rgba[:, :, 3] = obj_mask
-                    obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
-                    blended_img = blend_object(obj_cutout, bg_info["bg_image"])
+                    print(f"    ⚠ Object {obj_idx}: No difference detected, skipping")
+                    continue
+                
+                # 객체 추출 및 Option G 블렌딩
+                obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
+                obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
+                obj_only_rgba[:, :, 3] = obj_mask
+                obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
+                blended_img = blend_object(obj_cutout, bg_info["bg_image"])
                 
                 depth_suffix = "_depth" if use_depth else ""
                 output_filename = (
@@ -622,10 +732,10 @@ def composite_naturally(
                 blended_img.save(output_path)
                 output_paths.append(output_path)
                 
-                print(f"??Saved: {output_filename}")
+                print(f"      Saved: {output_filename}")
             
             except Exception as e:
-                print(f"✗ Error: bg{bg_idx} + obj{obj_idx}: {e}")
+                print(f"    ✗ Error: obj{obj_idx}: {e}")
                 import traceback
                 traceback.print_exc()
                 continue
