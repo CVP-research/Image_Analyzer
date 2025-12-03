@@ -8,6 +8,8 @@ from PIL import Image
 from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
+import cv2
+import numpy as np
 
 from segment import run_segmentation
 from embedding import EmbeddingManager
@@ -21,14 +23,20 @@ class SemanticMatcher:
     def __init__(
         self,
         similarity_threshold: float = 0.8,
-        cache_dir: Path = None
+        cache_dir: Path = None,
+        upscale_backgrounds: bool = True,
+        upscale_factor: float = 4.0
     ):
         """
         Args:
             similarity_threshold: 유사도 임계값
             cache_dir: 캐시 디렉토리
+            upscale_backgrounds: 배경 이미지 업스케일링 여부
+            upscale_factor: 업스케일 배율 (기본 4배)
         """
         self.similarity_threshold = similarity_threshold
+        self.upscale_backgrounds = upscale_backgrounds
+        self.upscale_factor = upscale_factor
         
         # 캐시 설정
         if cache_dir is None:
@@ -41,6 +49,32 @@ class SemanticMatcher:
         
         # 임베딩 매니저 초기화
         self.embedding_manager = EmbeddingManager(cache_dir=cache_dir)
+    
+    def upscale_image(self, img: Image.Image) -> Image.Image:
+        """
+        이미지를 고해상도로 업스케일링
+        
+        Args:
+            img: PIL Image 객체
+        
+        Returns:
+            업스케일된 PIL Image
+        """
+        if not self.upscale_backgrounds or self.upscale_factor <= 1.0:
+            return img
+        
+        w, h = img.size
+        new_w = int(w * self.upscale_factor)
+        new_h = int(h * self.upscale_factor)
+        
+        # OpenCV로 변환하여 LANCZOS4 업스케일링
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        upscaled_cv = cv2.resize(img_cv, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        upscaled_rgb = cv2.cvtColor(upscaled_cv, cv2.COLOR_BGR2RGB)
+        
+        print(f"    [Upscale] {w}x{h} → {new_w}x{new_h} ({self.upscale_factor}x)")
+        
+        return Image.fromarray(upscaled_rgb)
     
     def get_segment_labels(self, image_path: Path, use_cache: bool = True) -> List[str]:
         """
@@ -108,6 +142,9 @@ class SemanticMatcher:
             
             # 이미지 로드
             bg_img = Image.open(bg_path).convert("RGB")
+            
+            # 업스케일링 (설정된 경우)
+            bg_img = self.upscale_image(bg_img)
             
             # Segmentation
             annotations, labeled_results = run_segmentation(bg_img)

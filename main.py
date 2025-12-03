@@ -2,12 +2,11 @@
 Few-shot Semantic Compositing Pipeline - Main Entry Point
 
 전체 파이프라인:
-1. [TODO] 입력 이미지에서 가장 좋은 3장 선택
-2. [IMPLEMENTED] Veo3로 360도 뷰 영상 생성 (시뮬레이션)
-3. [IMPLEMENTED] 객체만 segmentation
-4. [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
-5. [TODO] 자연스러운 합성 (depth, lighting)
-
+1. 입력 이미지에서 가장 좋은 3장 선택
+2. Veo3로 360도 뷰 영상 생성 (시뮬레이션)
+3. 객체만 segmentation
+4. 의미론적으로 적합한 배경 위치 찾기
+5. 자연스러운 합성 (depth, lighting)
 모듈 구조:
 - depth.py: Depth 추론
 - segment.py: Segmentation
@@ -17,12 +16,10 @@ Few-shot Semantic Compositing Pipeline - Main Entry Point
 - semantic_matcher.py: 의미론적 배경 매칭
 """
 
-import hashlib
 import os
 import random
 import sys
 import time
-import json
 import math
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -30,15 +27,15 @@ from typing import Dict, List, Tuple
 import cv2
 import numpy as np
 from PIL import Image
-from ultralytics import SAM
 
 from google import genai
 from google.genai import types
 
 from semantic_matcher import SemanticMatcher
 from composite import composite_on_segment, compute_segment_averaged_depth
-from utils import get_all_objects
+from utils import frame_from_video, get_all_objects, load_camera_poses, compute_center, compute_azimuth_elevation, _fixed_grid_selection, _robust_greedy_selection
 from depth import compute_depth
+from segment import get_sam_model
 
 
 # ============================================================
@@ -48,7 +45,7 @@ def adjust_lighting_and_temperature(
     obj_cv: np.ndarray, 
     bg_cv: np.ndarray, 
     mask_bin: np.ndarray,
-    brightness_strength: float = 0.3,
+    brightness_strength: float = 0.2,
     temperature_strength: float = 0.2
 ) -> np.ndarray:
     """
@@ -58,7 +55,7 @@ def adjust_lighting_and_temperature(
         obj_cv: 객체 이미지 (BGR)
         bg_cv: 배경 이미지 (BGR)
         mask_bin: 객체 마스크
-        brightness_strength: 밝기 조정 강도 (0.3 = 30% 배경 밝기에 맞춤)
+        brightness_strength: 밝기 조정 강도 (0.2 = 20% 배경 밝기에 맞춤)
         temperature_strength: 색온도 조정 강도 (0.2 = 20% 배경 색온도에 맞춤)
     
     Returns:
@@ -117,12 +114,12 @@ INPUT_DIR = BASE_DIR / "input"
 VIDEO_DIR = BASE_DIR / "output" / "video"
 OUTPUT_DIR = BASE_DIR / "output" / "dataset"
 MASKED_FRAMES_DIR = BASE_DIR / "output" / "dataset" / "masked_frames"
+POSE_DIR = INPUT_DIR / "pose"
 VIDEO_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-POSES_FILE = BASE_DIR / "veo_pose_project" / "backend" / "camera_poses.json"
-
-SAM_MODEL = None
+POSE_DIR.mkdir(parents=True, exist_ok=True)
+POSES_FILE = POSE_DIR / "camera_poses.json"
 
 # Generative AI 클라이언트 초기화
 try:
@@ -136,132 +133,82 @@ except Exception as e:
     print(f"Error initializing Google Generative AI client: {e}")
     sys.exit(1)
 
-# Global variable for the SAM model to ensure it's loaded only once.
-
-
-def get_sam_model():
-    """Loads and returns the SAM model, caching it globally."""
-    global SAM_MODEL
-    if SAM_MODEL is None:
-        print("Loading SAM model...")
-        SAM_MODEL = SAM("sam2_l.pt")
-        print("SAM model loaded.")
-    return SAM_MODEL
-
-
-def load_camera_poses(path: Path) -> Dict[str, dict]:
-    """backend/camera_poses.json 로드"""
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def compute_center(poses: Dict[str, dict]) -> List[float]:
-    """
-    모든 look_at의 평균을 '객체 중심'으로 사용.
-    (대부분 [0,0,0]일 가능성이 높지만, 일반화해서 계산)
-    """
-    xs, ys, zs = [], [], []
-    for p in poses.values():
-        lx, ly, lz = p["look_at"]
-        xs.append(lx); ys.append(ly); zs.append(lz)
-
-    n = len(xs) if xs else 1
-    return [sum(xs)/n, sum(ys)/n, sum(zs)/n]
-
-
-def circular_distance(a: float, b: float) -> float:
-    """원 위에서 두 각도의 차이를 0~180도 범위로 계산"""
-    d = abs(a - b) % 360.0
-    return min(d, 360.0 - d)
-
-
-def pick_best_3(
-    poses: Dict[str, dict],
-    elevation_limit: float = 60.0,
-    num_views: int = 3
-):
-    """
-    포즈들로부터 '좋은' 3장 선택
-    - elevation 너무 큰 건 제외 (탑뷰/바닥뷰 제거)
-    - 정면(azimuth≈0°) 1장은 무조건 포함
-    - 나머지 2장은 수평 방향(azimuth)이 서로 최대한 멀리 떨어지게
-    """
-    center = compute_center(poses)
-    cx, cy, cz = center
-
-    view_infos = []
-    for filename, p in poses.items():
-        px, py, pz = p["position"]
-
-        # 객체 중심 기준 위치 벡터
-        vx, vy, vz = px - cx, py - cy, pz - cz
-        r = math.sqrt(vx*vx + vy*vy + vz*vz) + 1e-8
-
-        # 수평각(azimuth), 수직각(elevation)
-        azimuth = math.degrees(math.atan2(vx, vz))      # x-z 평면 기준
-        elevation = math.degrees(math.asin(vy / r))     # y 기준
-
-        view_infos.append({
-            "filename": filename,
-            "azimuth": azimuth,
-            "elevation": elevation,
-            "distance": r,
-        })
-
-    # 1) elevation 필터: 너무 위/아래(예: > 60도)는 제거
-    filtered = [
-        v for v in view_infos
-        if abs(v["elevation"]) <= elevation_limit
-    ]
-    if len(filtered) < num_views:
-        # 필터링하고 남은 게 너무 적으면 그냥 다 씀
-        filtered = view_infos
-
-    # 2) 정면 찾기: azimuth 절대값이 최소인 뷰
-    front_view = min(filtered, key=lambda v: abs(v["azimuth"]))
-
-    # front를 뺀 나머지 후보들
-    remaining = [v for v in filtered if v is not front_view]
-
-    if len(remaining) <= 2:
-        chosen = [front_view] + remaining
-        chosen = chosen[:3]
-        chosen.sort(key=lambda v: v["azimuth"])
-        return chosen
-
-    # 3) 두 번째 뷰: front와 수평각이 가장 멀리 떨어진 뷰
-    second = max(
-        remaining,
-        key=lambda v: circular_distance(v["azimuth"], front_view["azimuth"])
-    )
-
-    # 4) 세 번째 뷰: front / second 양쪽과 모두 멀리 떨어진 뷰
-    remaining2 = [v for v in remaining if v is not second]
-
-    def score(v):
-        return min(
-            circular_distance(v["azimuth"], front_view["azimuth"]),
-            circular_distance(v["azimuth"], second["azimuth"])
-        )
-
-    third = max(remaining2, key=score)
-
-    chosen = [front_view, second, third]
-    chosen.sort(key=lambda v: v["azimuth"])
-    return chosen
-
 # ============================================================
 # Step 1: 카메라 포즈를 이용해서 "좋은" 3장 선택
 # ============================================================
 def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path]:
     """
-    camera_poses.json에 저장된 카메라 포즈 정보를 사용해서
-    - 너무 위/아래에서 찍힌 샷(elevation 큰 것)은 제외하고
-    - 정면(azimuth≈0°) 1장을 무조건 포함시키고
-    - 나머지 2장은 수평각(azimuth)이 서로 최대한 벌어지도록 선택
-
+    Adaptive Hybrid 알고리즘으로 Veo3 최적화 뷰 선택
+    
+    - 균일 분포: Fixed Grid (0°, 120°, -120° 근처 선택)
+    - 불규칙 분포: Robust Greedy (3D 거리 최대화)
+    
+    자동으로 입력 분포를 분석하여 최적 전략 사용
     만약 포즈 파일이 없거나 문제 있으면, 이전처럼 랜덤 3장으로 fallback.
     """
+    def pick_best_3(
+        poses: Dict[str, dict],
+        elevation_limit: float = 30.0,
+        num_views: int = 3
+    ):
+        """
+        Adaptive Hybrid: Veo3 few-shot 최적화 알고리즘
+        
+        전략:
+        - 균일 분포 입력: Fixed Grid (이상적 위치 0°, 120°, -120°)
+        - 불규칙 입력: Robust Greedy (3D 거리 최대화)
+        
+        자동으로 입력 분포를 분석하여 최적 전략 선택
+        """
+        center = compute_center(poses)
+        view_infos = []
+        
+        for filename, p in poses.items():
+            azimuth, elevation, distance = compute_azimuth_elevation(p["position"], center)
+            
+            # 3D 단위 벡터로 변환 (구면 거리 계산용)
+            az_rad = math.radians(azimuth)
+            el_rad = math.radians(elevation)
+            x = math.cos(el_rad) * math.sin(az_rad)
+            y = math.sin(el_rad)
+            z = math.cos(el_rad) * math.cos(az_rad)
+            
+            view_infos.append({
+                "filename": filename,
+                "azimuth": azimuth,
+                "elevation": elevation,
+                "distance": distance,
+                "vec": (x, y, z)
+            })
+        
+        # 1) Elevation 필터링
+        filtered = [v for v in view_infos if abs(v["elevation"]) <= elevation_limit]
+        if len(filtered) < num_views:
+            print(f"  [WARN] Only {len(filtered)} views within ±{elevation_limit}°, relaxing filter")
+            filtered = sorted(view_infos, key=lambda v: abs(v["elevation"]))[:max(num_views, len(view_infos))]
+        
+        # 2) 입력 분포 분석: 이상적 위치에 가까운 뷰가 있는지 확인
+        ideal_positions = [(0, 0), (120, 0), (-120, 0)]
+        close_to_ideal = []
+        
+        for ideal_az, ideal_el in ideal_positions:
+            for v in filtered:
+                # 원형 거리 계산
+                az_diff = min(abs(v["azimuth"] - ideal_az), 360 - abs(v["azimuth"] - ideal_az))
+                el_diff = abs(v["elevation"] - ideal_el)
+                
+                if az_diff < 25 and el_diff < 15:  # 이상적 위치 근처
+                    close_to_ideal.append((ideal_az, v))
+                    break
+        
+        # 3) 전략 선택
+        if len(close_to_ideal) >= 2:
+            print(f"  [INFO] Uniform distribution detected, using Fixed Grid strategy")
+            return _fixed_grid_selection(filtered, ideal_positions)
+        else:
+            print(f"  [INFO] Irregular distribution detected, using Robust Greedy strategy")
+            return _robust_greedy_selection(filtered)
+    
     print(f"\n[Step 1] Selecting {num_views} best views from {len(input_images)} images using camera poses...")
 
     # 1) 포즈 JSON 로드
@@ -278,10 +225,14 @@ def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path
             return input_images
         return random.sample(input_images, num_views)
 
-    # 2) 포즈 기반으로 '좋은 3장' 선택 (정면 포함 로직)
-    chosen = pick_best_3(poses, elevation_limit=60.0, num_views=num_views)
+    # 2) 포즈 기반으로 '좋은 3장' 선택 (Veo3 최적화)
+    chosen = pick_best_3(poses, elevation_limit=30.0, num_views=num_views)
     chosen_filenames = [v["filename"] for v in chosen]
     print("  Chosen filenames (from poses):", chosen_filenames)
+    
+    # 선택된 뷰의 상세 정보 출력
+    for v in chosen:
+        print(f"    - {v['filename']}: azimuth={v['azimuth']:.1f}°, elevation={v['elevation']:.1f}°")
 
     # 3) 파일 이름 -> 실제 Path로 매핑
     name_to_path = {p.name: p for p in input_images}
@@ -308,8 +259,6 @@ def select_best_views(input_images: List[Path], num_views: int = 3) -> List[Path
 # ============================================================
 # Step 2: Veo3로 360도 뷰 영상 생성
 # ============================================================
-
-
 def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
     """
     Veo3 API를 호출하여 360도 뷰 영상 생성
@@ -381,51 +330,9 @@ def generate_360_video_with_veo3(selected_images: List[Path]) -> Path:
         print(f"Veo API Exception: {e}")
         raise e
 
-
-def frame_from_video(video_path: Path, output_dir: Path) -> None:
-    """
-    Veo3로 생성된 360도 영상에서 유일한 프레임만 분리 및 저장
-    
-    Args:
-        video_path: Veo3에서 생성된 360도 영상 파일 경로
-        output_dir: 분리된 프레임 저장 디렉토리 경로
-    """
-    print(f"\n[Frame Extraction] Extracting unique frames from video: {video_path.name}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    cap = cv2.VideoCapture(str(video_path))
-    frame_idx = 0
-    saved_idx = 0
-    seen_hashes = set()
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        # 프레임을 해시로 변환
-        frame_hash = hashlib.md5(frame.tobytes()).hexdigest()
-        if frame_hash in seen_hashes:
-            frame_idx += 1
-            continue  # 이미 저장된 프레임이면 건너뜀
-
-        seen_hashes.add(frame_hash)
-        frame_filename = output_dir / f"frame_{saved_idx:04d}.png"
-        cv2.imwrite(str(frame_filename), frame)
-        print(f"  Saved unique frame: {frame_filename.name}")
-        frame_idx += 1
-        saved_idx += 1
-
-    cap.release()
-    print(f"✓ Extracted {saved_idx} unique frames to {output_dir}")
-
-
-
 # ============================================================
 # Step 3: 객체만 segmentation
 # ============================================================
-
-
 def segment_objects(frame_dir: Path) -> None:
     """
     Segments the main object from each frame in a directory and saves them to MASKED_FRAMES_DIR.
@@ -486,7 +393,7 @@ def segment_objects(frame_dir: Path) -> None:
     print(f"Completed segmentation of {len(frames)} frames.")
 
 # ============================================================
-# Step 4: 의미론적으로 적합한 배경 위치 찾기 [IMPLEMENTED]
+# Step 4: 의미론적으로 적합한 배경 위치 찾기
 # ============================================================
 def find_suitable_backgrounds(
     object_category: str,
@@ -494,7 +401,9 @@ def find_suitable_backgrounds(
     broad_categories: List[str] = None,
     max_backgrounds: int = 5,
     similarity_threshold: float = 0.8,
-    max_workers: int = 5
+    max_workers: int = 5,
+    upscale_backgrounds: bool = True,
+    upscale_factor: float = 4.0
 ) -> List[Dict]:
     """
     의미론적으로 적합한 배경 위치 찾기
@@ -506,6 +415,8 @@ def find_suitable_backgrounds(
         max_backgrounds: 최대 배경 개수
         similarity_threshold: 유사도 임계값
         max_workers: 병렬 워커 수
+        upscale_backgrounds: 배경 이미지 업스케일링 여부 (기본 True)
+        upscale_factor: 업스케일 배율 (기본 4배: 256x256 → 1024x1024)
     
     Returns:
         배경 정보 리스트 [{"bg_image": Image, "segment_mask": np.ndarray, ...}]
@@ -515,8 +426,14 @@ def find_suitable_backgrounds(
     print(f"Semantic locations: {semantic_locations}")
     if broad_categories:
         print(f"  Broad categories: {broad_categories}")
+    if upscale_backgrounds:
+        print(f"  Background upscaling: ENABLED ({upscale_factor}x)")
     
-    matcher = SemanticMatcher(similarity_threshold=similarity_threshold)
+    matcher = SemanticMatcher(
+        similarity_threshold=similarity_threshold,
+        upscale_backgrounds=upscale_backgrounds,
+        upscale_factor=upscale_factor
+    )
     
     suitable_backgrounds = matcher.find_suitable_backgrounds(
         semantic_locations=semantic_locations,
@@ -645,10 +562,10 @@ def composite_naturally(
         저장된 합성 이미지 경로 리스트
     
     구현:
-        - [IMPLEMENTED] Depth 기반 occlusion 처리
-        - [IMPLEMENTED] Option G lighting 조정 (blend_object 함수에서 자동 적용)
-        - [IMPLEMENTED] 배경당 랜덤 객체 선택
-        - [IMPLEMENTED] 가려짐 비율 체크
+        - Depth 기반 occlusion 처리
+        - Option G lighting 조정 (blend_object 함수에서 자동 적용)
+        - 배경당 랜덤 객체 선택
+        - 가려짐 비율 체크
     """
     
     print(f"\n[Step 5] Compositing objects naturally...")
@@ -749,8 +666,6 @@ def composite_naturally(
 # ============================================================
 # 전체 파이프라인 실행 함수
 # ============================================================
-
-
 def run_full_pipeline(
     object_category: str = "object",
     semantic_locations: List[str] = None,
@@ -815,7 +730,9 @@ def run_full_pipeline(
         broad_categories=broad_categories,
         max_backgrounds=max_backgrounds,
         similarity_threshold=similarity_threshold,
-        max_workers=max_workers
+        max_workers=max_workers,
+        upscale_backgrounds=True,  # 배경 업스케일링 활성화
+        upscale_factor=4.0  # 256x256 → 1024x1024
     )
     
     if len(backgrounds) == 0:
@@ -851,18 +768,18 @@ def main():
     메인 엔트리 포인트
     
     전체 파이프라인:
-    1. [TODO] 입력 이미지에서 가장 좋은 3장 선택
-    2. [IMPLEMENTED] Veo3로 360도 뷰 영상 생성 (시뮬레이션)
-    3. [IMPLEMENTED] 객체만 segmentation
-    4. [IMPLEMENTED] 의미론적으로 적합한 배경 위치 찾기
-    5. [TODO] 자연스러운 합성 (depth, lighting)
+    1. 입력 이미지에서 가장 좋은 3장 선택
+    2. Veo3로 360도 뷰 영상 생성 (시뮬레이션)
+    3. 객체만 segmentation
+    4. 의미론적으로 적합한 배경 위치 찾기
+    5. 자연스러운 합성 (depth, lighting)
     """
     print("=== Few-shot Semantic Compositing Pipeline ===")
-    print("[TODO] Step 1: Select 3 appropriate views from input images")
-    print("[IMPLEMENTED] Step 2: Generate 360° video with Veo3 (Simulated)")
-    print("[IMPLEMENTED] Step 3: Segment objects from video")
-    print("[IMPLEMENTED] Step 4: Find semantically suitable backgrounds")
-    print("[TODO] Step 5: Composite naturally with depth and lighting")
+    print("Step 1: Select 3 appropriate views from input images")
+    print("Step 2: Generate 360° video with Veo3 (Simulated)")
+    print("Step 3: Segment objects from video")
+    print("Step 4: Find semantically suitable backgrounds")
+    print("Step 5: Composite naturally with depth and lighting")
     print()
     
     # 전체 파이프라인 실행

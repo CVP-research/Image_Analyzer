@@ -3,6 +3,10 @@ import numpy as np
 import cv2
 from transformers import pipeline
 import colorsys
+from ultralytics import SAM
+
+# Global SAM model cache
+SAM_MODEL = None
 
 # Segment model (GPU)
 seg_pipe = pipeline(
@@ -10,6 +14,21 @@ seg_pipe = pipeline(
     model="shi-labs/oneformer_coco_swin_large",
     device=0
 )
+
+
+def get_sam_model():
+    """
+    SAM 모델을 로드하고 반환 (전역 캐싱)
+    
+    Returns:
+        SAM 모델 인스턴스
+    """
+    global SAM_MODEL
+    if SAM_MODEL is None:
+        print("Loading SAM model...")
+        SAM_MODEL = SAM("sam2_l.pt")
+        print("SAM model loaded.")
+    return SAM_MODEL
 
 # Distinct colors
 def generate_distinct_colors(n=100):
