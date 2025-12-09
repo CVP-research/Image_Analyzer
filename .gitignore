@@ -221,3 +221,4 @@ Depth-Anything-V2/checkpoints/*.pt
 dataset/
 credentials.json
 *.pt
+runs/

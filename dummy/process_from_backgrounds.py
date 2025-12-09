@@ -29,12 +29,13 @@ def process_from_backgrounds(
     object_category: str = "object",
     semantic_locations: List[str] = None,
     broad_categories: List[str] = None,
-    max_backgrounds: int = 5,
-    similarity_threshold: float = 0.8,
+    max_backgrounds: int = 800,
+    similarity_threshold: float = 0.7,
     overlay_scale: float = 0.8,
     use_depth: bool = True,
     use_lighting: bool = False,
-    max_workers: int = 5
+    max_workers: int = 5,
+    target_images: int = 1600
 ) -> List[Path]:
     """
     이미 segmentation이 완료된 데이터로 파이프라인 실행
@@ -44,18 +45,20 @@ def process_from_backgrounds(
         object_category: 객체 카테고리
         semantic_locations: 의미론적 위치 리스트
         broad_categories: 대분류 카테고리 리스트
-        max_backgrounds: 최대 배경 개수
-        similarity_threshold: 유사도 임계값
+        max_backgrounds: 최대 배경 개수 (기본 800)
+        similarity_threshold: 유사도 임계값 (기본 0.7)
         overlay_scale: 오버레이 스케일
         use_depth: Depth 사용 여부
         use_lighting: Lighting 사용 여부
         max_workers: 병렬 워커 수
+        target_images: 목표 이미지 개수 (기본 1200)
     
     Returns:
         생성된 합성 이미지 경로 리스트
     """
     print("=" * 60)
     print("Processing from Pre-segmented Data")
+    print(f"Target: {target_images} images")
     print("=" * 60)
     print("Skipping: Frame extraction, Segmentation")
     print("Running: Background finding, Compositing")
@@ -102,7 +105,7 @@ def process_from_backgrounds(
         print("Warning: No objects loaded!")
         return []
     
-    # Step 3: 자연스러운 합성
+    # Step 3: 자연스러운 합성 (동적 할당)
     print(f"\n[Step 3] Compositing naturally...")
     output_paths = composite_naturally(
         objects=objects,
@@ -111,8 +114,9 @@ def process_from_backgrounds(
         use_lighting=use_lighting,
         overlay_scale=overlay_scale,
         depth_offset=0.05,
-        objects_per_bg=2,  # 배경당 2개 객체만 선택
-        occlusion_threshold=0.3  # 30% 이상 가려지면 스킵
+        occlusion_threshold=0.15,  # 15% 이상 가려지면 스킵
+        target_images=target_images,
+        class_name=object_category.replace(" ", "_")
     )
     
     print("\n" + "=" * 60)
@@ -138,12 +142,13 @@ def main():
         object_category="monkey doll",
         semantic_locations=["shelf", "bed", "couch", "table", "toy box"],
         broad_categories=["home", "indoor", "living room", "bedroom", "house interior"],
-        max_backgrounds=5,
-        similarity_threshold=0.8,
+        max_backgrounds=800,
+        similarity_threshold=0.7,
         overlay_scale=0.8,
         use_depth=True,
         use_lighting=True,  # Option G 활성화
-        max_workers=5
+        max_workers=5,
+        target_images=1600
     )
     
     if results:

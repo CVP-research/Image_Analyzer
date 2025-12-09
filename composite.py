@@ -206,6 +206,66 @@ def composite_with_depth(
     return Image.fromarray(result_uint8), occlusion_ratio if total_pixels > 0 else 0.0
 
 
+def compute_visible_mask(
+    overlay_image: Image.Image,
+    overlay_position: Tuple[int, int],
+    bg_depth_map: np.ndarray,
+    overlay_depth: float
+) -> np.ndarray:
+    """
+    Depth 기반 occlusion을 고려하여 실제로 보이는 객체 마스크 계산
+    
+    배경의 depth map과 비교하여 배경에 가려지는 픽셀을 제거한
+    실제 visible mask를 반환합니다 (YOLO annotation용)
+    
+    Args:
+        overlay_image: 누끼 이미지 (RGBA)
+        overlay_position: 오버레이 중심 위치 (x, y)
+        bg_depth_map: 배경 depth map (원본, 값이 클수록 가까움)
+        overlay_depth: 오버레이 depth 값 (0-1 정규화됨)
+    
+    Returns:
+        visible mask (H x W, bool array) - 배경 이미지 크기
+    """
+    overlay_array = np.array(overlay_image)
+    h_ov, w_ov = overlay_array.shape[:2]
+    h_bg, w_bg = bg_depth_map.shape[:2]
+    
+    # 배경 depth map 정규화
+    depth_min, depth_max = bg_depth_map.min(), bg_depth_map.max()
+    bg_depth_norm = (bg_depth_map - depth_min) / (depth_max - depth_min + 1e-8)
+    
+    # 알파 채널 추출 (원본 객체 마스크)
+    alpha = overlay_array[:, :, 3] > 0
+    
+    # 배경 크기의 visible mask 생성
+    visible_mask = np.zeros((h_bg, w_bg), dtype=bool)
+    
+    # 중심 기준으로 top-left 좌표 계산
+    center_x, center_y = overlay_position
+    x_offset = center_x - w_ov // 2
+    y_offset = center_y - h_ov // 2
+    
+    # 각 픽셀에 대해 depth 비교
+    for i in range(h_ov):
+        for j in range(w_ov):
+            # 투명한 픽셀은 건너뛰기
+            if not alpha[i, j]:
+                continue
+            
+            bg_y = y_offset + i
+            bg_x = x_offset + j
+            
+            # 범위 체크
+            if 0 <= bg_x < w_bg and 0 <= bg_y < h_bg:
+                # Depth 비교: 배경보다 앞에 있으면 visible
+                bg_depth_value = bg_depth_norm[bg_y, bg_x]
+                if overlay_depth >= bg_depth_value:
+                    visible_mask[bg_y, bg_x] = True
+    
+    return visible_mask
+
+
 def compute_segment_depth(
     depth_map: np.ndarray,
     segment_mask: np.ndarray,
@@ -248,8 +308,9 @@ def composite_on_segment(
     base_scale: float = 1.0,
     use_depth: bool = False,
     bg_depth_map: np.ndarray = None,
-    depth_offset: float = 0.05
-) -> Tuple[Image.Image, float]:
+    depth_offset: float = 0.05,
+    rotation_angle: float = 0.0
+) -> Tuple[Image.Image, float, np.ndarray]:
     """
     Segment 영역에 오버레이 합성 - segment 크기에 맞춰 자동 스케일링
     
@@ -261,39 +322,63 @@ def composite_on_segment(
         use_depth: depth 기반 occlusion 사용 여부
         bg_depth_map: 배경 이미지의 depth map (use_depth=True일 때 필요)
         depth_offset: overlay를 앞으로 당길 오프셋 (기본 0.05)
+        rotation_angle: 회전 각도 (degree, 반시계방향)
     
     Returns:
-        (합성된 이미지, occlusion 비율)
+        (합성된 이미지, occlusion 비율, visible mask)
+        - visible mask: 배경 이미지 크기의 bool array (depth 기반 가려짐 제외)
     """
     # Segment 영역 분석
     ys, xs = np.where(segment_mask)
     if len(xs) == 0:
         # segment 없으면 중앙에 배치
-        center_x, center_y = bg_image.size[0] // 2, bg_image.size[1] // 2
+        segment_min_x = bg_image.size[0] // 4
+        segment_max_x = bg_image.size[0] * 3 // 4
+        segment_min_y = bg_image.size[1] // 4
+        segment_max_y = bg_image.size[1] * 3 // 4
         segment_width = bg_image.size[0] // 4
         segment_height = bg_image.size[1] // 4
     else:
         # segment의 바운딩 박스 계산
-        min_x, max_x = xs.min(), xs.max()
-        min_y, max_y = ys.min(), ys.max()
-        segment_width = max_x - min_x
-        segment_height = max_y - min_y
-        
-        # segment 중심에 배치
-        center_x = (min_x + max_x) // 2
-        center_y = (min_y + max_y) // 2
+        segment_min_x, segment_max_x = int(xs.min()), int(xs.max())
+        segment_min_y, segment_max_y = int(ys.min()), int(ys.max())
+        segment_width = segment_max_x - segment_min_x
+        segment_height = segment_max_y - segment_min_y
     
     # 오버레이 스케일 자동 계산
-    # segment 크기의 60-80% 정도로 맞춤
+    # segment 크기의 90% 정도로 맞춤 (base_scale 적용)
     overlay_w, overlay_h = overlay_image.size
     
-    # 가로/세로 비율 유지하면서 segment에 맞춤
-    scale_x = (segment_width * 0.7 * base_scale) / overlay_w
-    scale_y = (segment_height * 0.7 * base_scale) / overlay_h
-    auto_scale = min(scale_x, scale_y)
+    # 220~280px 크기 보장 (base_scale 적용)
+    min_size = 220
+    max_size = 280
     
-    # 너무 작거나 크지 않도록 제한
-    auto_scale = np.clip(auto_scale, 0.1, 3.0)
+    # base_scale을 기본으로 사용 (이미 180~220px 범위로 계산됨)
+    auto_scale = base_scale
+    
+    # 먼저 최소 크기 보장 확인
+    min_dim_target = min(overlay_w * auto_scale, overlay_h * auto_scale)
+    if min_dim_target < min_size:
+        auto_scale = min_size / min(overlay_w, overlay_h)
+    
+    # Segment보다 너무 크면 segment에 맞춘 후, 다시 최소 크기 체크
+    scale_x = (segment_width * 0.9) / (overlay_w * auto_scale)
+    scale_y = (segment_height * 0.9) / (overlay_h * auto_scale)
+    
+    if scale_x < 1.0 or scale_y < 1.0:
+        # Segment에 맞춰 축소
+        segment_scale = auto_scale * min(scale_x, scale_y)
+        
+        # 축소 후에도 최소 크기 반드시 보장
+        min_dim_after = min(overlay_w * segment_scale, overlay_h * segment_scale)
+        if min_dim_after < min_size:
+            # 최소 크기보다 작아지면 segment 무시하고 최소 크기 우선
+            auto_scale = min_size / min(overlay_w, overlay_h)
+        else:
+            auto_scale = segment_scale
+    
+    # 최종 안전 제한
+    auto_scale = np.clip(auto_scale, 0.15, 3.0)
     
     if auto_scale != 1.0:
         new_w = int(overlay_w * auto_scale)
@@ -303,10 +388,55 @@ def composite_on_segment(
             Image.Resampling.LANCZOS
         )
     
-    print(f"    Segment size: {segment_width}x{segment_height}, Auto scale: {auto_scale:.2f}, Center: ({center_x}, {center_y})")
+    # 회전 적용 (알파 채널 유지)
+    if rotation_angle != 0.0:
+        overlay_image = overlay_image.rotate(
+            rotation_angle,
+            resample=Image.Resampling.BICUBIC,
+            expand=True,  # 회전 후 잘리지 않도록 캔버스 확장
+            fillcolor=(0, 0, 0, 0)  # 투명 배경
+        )
+    
+    final_w, final_h = overlay_image.size
+    half_w, half_h = final_w // 2, final_h // 2
+    
+    # Segment 내에서 랜덤 위치 선택 (배경과 segment 모두를 벗어나지 않도록)
+    bg_w, bg_h = bg_image.size
+    
+    # 배경 경계를 고려한 허용 범위
+    bg_min_x = half_w
+    bg_max_x = bg_w - half_w
+    bg_min_y = half_h
+    bg_max_y = bg_h - half_h
+    
+    # Segment와 배경 경계의 교집합 범위 계산
+    valid_min_x = max(segment_min_x, bg_min_x)
+    valid_max_x = min(segment_max_x, bg_max_x)
+    valid_min_y = max(segment_min_y, bg_min_y)
+    valid_max_y = min(segment_max_y, bg_max_y)
+    
+    # 유효 범위가 있는지 체크
+    if valid_min_x >= valid_max_x or valid_min_y >= valid_max_y:
+        # 유효 범위 없음 → segment 중심 사용
+        center_x = (segment_min_x + segment_max_x) // 2
+        center_y = (segment_min_y + segment_max_y) // 2
+        # 배경 안쪽으로 클리핑
+        center_x = int(np.clip(center_x, bg_min_x, bg_max_x))
+        center_y = int(np.clip(center_y, bg_min_y, bg_max_y))
+    else:
+        # 유효 범위 내에서 랜덤 선택
+        import random
+        center_x = random.randint(valid_min_x, valid_max_x)
+        center_y = random.randint(valid_min_y, valid_max_y)
+    
+    rotation_str = f", Rot: {rotation_angle:.1f}°" if rotation_angle != 0 else ""
+    print(f"    Segment: {segment_width}x{segment_height}, Scale: {auto_scale:.2f}, Final: {final_w}x{final_h}px, Pos: ({center_x},{center_y}){rotation_str}")
     
     # 합성 (adaptive depth offset)
     occlusion_ratio = 0.0
+    visible_mask = np.zeros((bg_image.size[1], bg_image.size[0]), dtype=bool)  # 기본값: 빈 마스크
+    overlay_depth = 0.5  # 기본값
+    
     if use_depth and bg_depth_map is not None:
         # 첫 시도: 기본 offset
         current_offset = depth_offset
@@ -331,6 +461,14 @@ def composite_on_segment(
                 print(f"    → Occlusion too high, retrying with offset={current_offset:.2f}")
             else:
                 break
+        
+        # Visible mask 계산 (depth 기반 occlusion 제외)
+        visible_mask = compute_visible_mask(
+            overlay_image,
+            (center_x, center_y),
+            bg_depth_map,
+            overlay_depth
+        )
     else:
         # 단순 합성 (depth 무시)
         result = composite_simple(
@@ -338,5 +476,22 @@ def composite_on_segment(
             overlay_image,
             (center_x, center_y)
         )
+        
+        # Depth 없이 합성한 경우: 알파 채널 기반 visible mask
+        overlay_array = np.array(overlay_image)
+        h_ov, w_ov = overlay_array.shape[:2]
+        alpha = overlay_array[:, :, 3] > 0
+        
+        visible_mask = np.zeros((bg_image.size[1], bg_image.size[0]), dtype=bool)
+        x_offset = center_x - w_ov // 2
+        y_offset = center_y - h_ov // 2
+        
+        for i in range(h_ov):
+            for j in range(w_ov):
+                if alpha[i, j]:
+                    bg_y = y_offset + i
+                    bg_x = x_offset + j
+                    if 0 <= bg_x < bg_image.size[0] and 0 <= bg_y < bg_image.size[1]:
+                        visible_mask[bg_y, bg_x] = True
     
-    return result, occlusion_ratio
+    return result, occlusion_ratio, visible_mask
