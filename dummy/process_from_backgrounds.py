@@ -50,8 +50,8 @@ def process_from_backgrounds(
         overlay_scale: 오버레이 스케일
         use_depth: Depth 사용 여부
         use_lighting: Lighting 사용 여부
-        max_workers: 병렬 워커 수
-        target_images: 목표 이미지 개수 (기본 1200)
+        max_workers: 병렬 워커 수 (배경 찾기 + 합성 모두 사용, 기본 5)
+        target_images: 목표 이미지 개수 (기본 1600)
     
     Returns:
         생성된 합성 이미지 경로 리스트
@@ -114,9 +114,10 @@ def process_from_backgrounds(
         use_lighting=use_lighting,
         overlay_scale=overlay_scale,
         depth_offset=0.05,
-        occlusion_threshold=0.15,  # 15% 이상 가려지면 스킵
+        occlusion_threshold=0.3,  # 30% 이상 가려지면 스킵
         target_images=target_images,
-        class_name=object_category.replace(" ", "_")
+        class_name=object_category.replace(" ", "_"),
+        max_workers=max_workers  # 병렬 워커 전달
     )
     
     print("\n" + "=" * 60)
@@ -147,7 +148,7 @@ def main():
         overlay_scale=0.8,
         use_depth=True,
         use_lighting=True,  # Option G 활성화
-        max_workers=5,
+        max_workers=7,  # 병렬 워커 7개
         target_images=1600
     )
     

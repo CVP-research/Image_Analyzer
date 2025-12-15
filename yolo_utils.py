@@ -51,8 +51,10 @@ def mask_to_yolo_polygon(
     # 가장 큰 contour 선택
     largest_contour = max(contours, key=cv2.contourArea)
     
-    # 너무 작은 contour는 무시 (최소 10 픽셀)
-    if cv2.contourArea(largest_contour) < 10:
+    # 너무 작은 contour는 무시 (최소 50 픽셀)
+    contour_area = cv2.contourArea(largest_contour)
+    if contour_area < 50:
+        print(f"    [DEBUG] Contour area too small: {contour_area:.1f} pixels")
         return ""
     
     # Contour를 normalized coordinates로 변환

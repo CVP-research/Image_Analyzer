@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import torch
 import cv2
 import numpy as np
+from tqdm import tqdm
 
 from segment import run_segmentation
 from embedding import EmbeddingManager
@@ -47,8 +48,31 @@ class SemanticMatcher:
         self.segment_labels_cache_dir = cache_dir / "segment_labels"
         self.segment_labels_cache_dir.mkdir(exist_ok=True)
         
+        # Segment 매칭 결과 캐시
+        self.segment_match_cache = {}  # {(bg_path, locations_tuple): match_result}
+        self.segment_match_cache_file = cache_dir / "segment_match_cache.pkl"
+        self._load_segment_match_cache()
+        
         # 임베딩 매니저 초기화
         self.embedding_manager = EmbeddingManager(cache_dir=cache_dir)
+    
+    def _load_segment_match_cache(self):
+        """Segment 매칭 결과 캐시 로드"""
+        if self.segment_match_cache_file.exists():
+            try:
+                with open(self.segment_match_cache_file, 'rb') as f:
+                    self.segment_match_cache = pickle.load(f)
+                print(f"  [Cache] Loaded {len(self.segment_match_cache)} segment match results")
+            except:
+                self.segment_match_cache = {}
+    
+    def _save_segment_match_cache(self):
+        """Segment 매칭 결과 캐시 저장"""
+        try:
+            with open(self.segment_match_cache_file, 'wb') as f:
+                pickle.dump(self.segment_match_cache, f)
+        except:
+            pass  # 저장 실패해도 계속 진행
     
     def upscale_image(self, img: Image.Image) -> Image.Image:
         """
@@ -72,7 +96,7 @@ class SemanticMatcher:
         upscaled_cv = cv2.resize(img_cv, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
         upscaled_rgb = cv2.cvtColor(upscaled_cv, cv2.COLOR_BGR2RGB)
         
-        print(f"    [Upscale] {w}x{h} → {new_w}x{new_h} ({self.upscale_factor}x)")
+        # print(f"    [Upscale] {w}x{h} → {new_w}x{new_h} ({self.upscale_factor}x)")
         
         return Image.fromarray(upscaled_rgb)
     
@@ -127,7 +151,7 @@ class SemanticMatcher:
         semantic_locations: List[str]
     ) -> Dict:
         """
-        단일 배경 이미지 처리
+        단일 배경 이미지 처리 (캐싱 지원)
         
         Args:
             bg_path: 배경 이미지 경로
@@ -137,9 +161,33 @@ class SemanticMatcher:
         Returns:
             매칭된 배경 정보 또는 None
         """
-        try:
-            print(f"Processing: {bg_path.name}")
+        # 캐시 키 생성 (경로 + locations)
+        cache_key = (str(bg_path), tuple(semantic_locations))
+        
+        # 캐시에서 확인
+        if cache_key in self.segment_match_cache:
+            cached_result = self.segment_match_cache[cache_key]
+            if cached_result is None:
+                return None  # 이전에 매칭 실패한 배경
             
+            # 캐시된 결과 반환 (이미지만 다시 로드)
+            try:
+                bg_img = Image.open(bg_path).convert("RGB")
+                bg_img = self.upscale_image(bg_img)
+                
+                return {
+                    "bg_path": bg_path,
+                    "bg_image": bg_img,
+                    "segment_mask": cached_result["segment_mask"],
+                    "segment_label": cached_result["segment_label"],
+                    "matched_location": cached_result["matched_location"],
+                    "similarity": cached_result["similarity"]
+                }
+            except:
+                # 캐시 무효화
+                del self.segment_match_cache[cache_key]
+        
+        try:
             # 이미지 로드
             bg_img = Image.open(bg_path).convert("RGB")
             
@@ -167,23 +215,27 @@ class SemanticMatcher:
                     sim_list.append((similarity, loc_idx))
                     
                     if similarity >= self.similarity_threshold:
-                        print(f"  ✓ Match found: '{segment_label}' ~ '{semantic_locations[loc_idx]}' (sim={similarity:.3f})")
-                        
-                        return {
-                            "bg_path": bg_path,
-                            "bg_image": bg_img,
+                        # 매칭 성공 - 캐시에 저장
+                        match_result = {
                             "segment_mask": mask,
                             "segment_label": segment_label,
                             "matched_location": semantic_locations[loc_idx],
                             "similarity": similarity
                         }
+                        self.segment_match_cache[cache_key] = match_result
+                        
+                        return {
+                            "bg_path": bg_path,
+                            "bg_image": bg_img,
+                            **match_result
+                        }
             
-            if sim_list:
-                print(f"  Max Similarity: {max(sim_list)[0]:.3f}")
+            # 매칭 실패 - 캐시에 None 저장
+            self.segment_match_cache[cache_key] = None
             return None
         
         except Exception as e:
-            print(f"  ✗ Error processing {bg_path.name}: {e}")
+            # 에러 발생 - 캐시하지 않음 (다음에 재시도)
             return None
     
     def find_suitable_backgrounds(
@@ -227,23 +279,98 @@ class SemanticMatcher:
             
             print(f"[Folder Filtering] Processing folders in similarity order...")
             
+            # 다양성을 위해 각 폴더에서 최대 개수 제한
+            max_per_folder = max(200, max_backgrounds // 4)  # 최소 200개, 또는 전체의 1/4
+            print(f"[Folder Filtering] Max per folder: {max_per_folder}")
+            
             # 유사도 높은 폴더부터 순차 처리
-            for folder, similarity in ranked_folders:
-                if len(suitable_backgrounds) >= max_backgrounds:
-                    break
+            pbar = tqdm(total=max_backgrounds, desc="Finding backgrounds", unit="bg")
+            folder_counts = {}  # 각 폴더에서 뽑은 개수 추적
+            
+            try:
+                for folder, similarity in ranked_folders:
+                    if len(suitable_backgrounds) >= max_backgrounds:
+                        break
+                    
+                    # 이 폴더에서 뽑을 수 있는 최대 개수
+                    remaining_for_folder = max_per_folder - folder_counts.get(folder.name, 0)
+                    if remaining_for_folder <= 0:
+                        continue  # 이 폴더는 이미 충분히 뽑음
+                    
+                    # 폴더 내 이미지 파일 찾기 (on-demand)
+                    folder_images = []
+                    for file in folder.iterdir():
+                        if file.is_file() and file.suffix.lower() in image_extensions:
+                            folder_images.append(file)
+                    
+                    if not folder_images:
+                        continue
+                    
+                    pbar.set_description(f"Scanning {folder.name}")
+                    folder_counts[folder.name] = folder_counts.get(folder.name, 0)
+                    
+                    # 이 폴더의 이미지들을 병렬 처리
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_bg = {
+                            executor.submit(
+                                self.process_single_background,
+                                bg_path,
+                                location_embeddings,
+                                semantic_locations
+                            ): bg_path
+                            for bg_path in folder_images
+                        }
+                        
+                        processed_count = 0  # 처리된 이미지 수 (매칭 성공/실패 포함)
+                        
+                        for future in as_completed(future_to_bg):
+                            try:
+                                result = future.result(timeout=10)  # 10초 타임아웃
+                                processed_count += 1
+                                
+                                if result is not None:
+                                    suitable_backgrounds.append(result)
+                                    folder_counts[folder.name] += 1
+                                    pbar.update(1)
+                                    pbar.set_postfix({
+                                        "folder": folder.name[:20], 
+                                        "sim": f"{similarity:.2f}",
+                                        "count": f"{folder_counts[folder.name]}/{max_per_folder}"
+                                    })
+                                    
+                                    # 전체 목표 달성 또는 이 폴더 할당량 달성
+                                    if len(suitable_backgrounds) >= max_backgrounds or \
+                                       folder_counts[folder.name] >= max_per_folder:
+                                        for f in future_to_bg:
+                                            f.cancel()
+                                        break
+                                
+                                # 매칭 실패가 너무 많으면 폴더 스킵 (효율성)
+                                # 50개 처리했는데 5개도 안 매칭되면 스킵 (10% 미만)
+                                if processed_count >= 50 and folder_counts[folder.name] < 5:
+                                    print(f"\n  Skipping {folder.name}: low match rate ({folder_counts[folder.name]}/{processed_count})")
+                                    for f in future_to_bg:
+                                        f.cancel()
+                                    break
+                                    
+                            except Exception as e:
+                                # 타임아웃 또는 에러 발생 시 스킵
+                                continue
                 
-                # 폴더 내 이미지 파일 찾기 (on-demand)
-                folder_images = []
-                for file in folder.iterdir():
-                    if file.is_file() and file.suffix.lower() in image_extensions:
-                        folder_images.append(file)
-                
-                if not folder_images:
-                    continue
-                
-                print(f"\n[Processing] {folder.name} ({similarity:.3f}): {len(folder_images)} images")
-                
-                # 이 폴더의 이미지들을 병렬 처리
+            except KeyboardInterrupt:
+                print(f"\n\n[Interrupted] User stopped the process. Found {len(suitable_backgrounds)}/{max_backgrounds} backgrounds.")
+                print("[Interrupted] Saving cache and proceeding with partial results...\n")
+                # 캐시 저장
+                self._save_segment_match_cache()
+            finally:
+                pbar.close()
+        else:
+            # 대분류 없으면 전체 디렉토리 스캔
+            
+            print(f"\n[Processing] Scanning all images in {dataset_dir}...")
+            all_images = find_all_images(dataset_dir, use_cache=True, cache_dir=self.cache_dir)
+            
+            try:
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     future_to_bg = {
                         executor.submit(
@@ -252,7 +379,7 @@ class SemanticMatcher:
                             location_embeddings,
                             semantic_locations
                         ): bg_path
-                        for bg_path in folder_images
+                        for bg_path in all_images
                     }
                     
                     for future in as_completed(future_to_bg):
@@ -264,31 +391,16 @@ class SemanticMatcher:
                                 for f in future_to_bg:
                                     f.cancel()
                                 break
-        else:
-            # 대분류 없으면 전체 디렉토리 스캔
-            
-            print(f"\n[Processing] Scanning all images in {dataset_dir}...")
-            all_images = find_all_images(dataset_dir, use_cache=True, cache_dir=self.cache_dir)
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_bg = {
-                    executor.submit(
-                        self.process_single_background,
-                        bg_path,
-                        location_embeddings,
-                        semantic_locations
-                    ): bg_path
-                    for bg_path in all_images
-                }
-                
-                for future in as_completed(future_to_bg):
-                    result = future.result()
-                    if result is not None:
-                        suitable_backgrounds.append(result)
-                        
-                        if len(suitable_backgrounds) >= max_backgrounds:
-                            for f in future_to_bg:
-                                f.cancel()
-                            break
+                                
+            except KeyboardInterrupt:
+                print(f"\n\n[Interrupted] User stopped the process. Found {len(suitable_backgrounds)}/{max_backgrounds} backgrounds.")
+                print("[Interrupted] Saving cache and proceeding with partial results...\n")
+                # 캐시 저장
+                self._save_segment_match_cache()
+        
+        # 캐시 저장
+        self._save_segment_match_cache()
+        print(f"\n  [Cache] Saved {len(self.segment_match_cache)} segment match results")
         
         return suitable_backgrounds
+

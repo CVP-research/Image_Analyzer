@@ -222,3 +222,11 @@ dataset/
 credentials.json
 *.pt
 runs/
+new/data/
+new/dataset/
+new/output/
+new/venv2/
+venv2/
+.vscode/
+Image-Harmonization-Dataset-iHarmony4/
+debug_output/

@@ -1,12 +1,15 @@
 """
-YOLOv8 Segmentation Fine-tuning Script
-Dataset: Custom synthetic dataset (1600 images)
-Model: YOLOv8s-seg (Small) - 빠른 학습 (1-1.5시간)
+YOLOv8 Segmentation Training from Scratch
+Dataset: Custom synthetic dataset (1600 positive + 200 negative)
+Model: YOLOv8s-seg (Small) - Scratch 학습 (COCO 지식 배제)
 """
 
 from ultralytics import YOLO
 import torch
 from pathlib import Path
+import time
+
+TRAIN_NAME = "train_veo3_v2"
 
 def main():
     # GPU 확인
@@ -17,108 +20,98 @@ def main():
         print(f"CUDA Version: {torch.version.cuda}")
     
     # 데이터셋 경로
-    data_yaml = Path("output/dataset/result/data.yaml")
+    data_yaml = Path(f"new/dataset/{TRAIN_NAME}/data.yaml")
     
     if not data_yaml.exists():
         print(f"❌ Error: {data_yaml} not found!")
         print("Please run process_from_backgrounds.py first to generate dataset.")
         return
-    
-    # YOLOv8s-seg 모델 선택 (빠른 학습, 1600장 데이터에 충분)
-    # - YOLOv8n-seg: 너무 가벼움
-    # - YOLOv8s-seg: ✅ 빠른 학습(1-1.5시간), 좋은 정확도 (추천)
-    # - YOLOv8m-seg: 더 높은 정확도, 느림 (2.5-3시간)
-    # - YOLOv8l-seg: 높은 정확도, 매우 느림 (5-6시간)
-    # - YOLOv8x-seg: GPU 메모리 부족 위험
-    
+
+    model = None
+    max_retries = 10
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            last_checkpoint_path = Path(f"runs/segment/{TRAIN_NAME}/weights/last.pt")
+
+            # Start or resume training
+            if last_checkpoint_path.exists():
+                print("\n" + "="*60)
+                print(f"✅ Checkpoint found! Resuming training from: {last_checkpoint_path}")
+                print("="*60 + "\n")
+                model = YOLO(last_checkpoint_path)
+                model.train(resume=True)
+            else:
+                print("\n" + "="*60)
+                print("🚀 No checkpoint found. Starting a new training session...")
+                print("="*60 + "\n")
+                
+                model = YOLO('yolov8m-seg.pt')
+                
+                print("\n" + "="*60)
+                print("Starting Fine-tuning...")
+                print("="*60 + "\n")
+                
+                model.train(
+                    data=str(data_yaml),
+                    epochs=100,
+                    imgsz=640,
+                    batch=15,
+                    device=device,
+                    project='runs/segment',
+                    name=TRAIN_NAME,
+                    exist_ok=True
+                )
+            
+            print("\n" + "="*60)
+            print("✅ Training successfully completed!")
+            print("="*60)
+            break  # Exit loop on success
+
+        except Exception as e:
+            retry_count += 1
+            print(f"\n🔥🔥🔥 An error occurred: {e} 🔥🔥🔥")
+            print(f"Attempting to resume... (Attempt {retry_count}/{max_retries})")
+            
+            # Release memory
+            model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print("CUDA cache cleared.")
+
+            if retry_count >= max_retries:
+                print("❌ Maximum retries reached. Exiting.")
+                return # Give up
+            
+            print("Waiting 30 seconds before retrying...")
+            time.sleep(30)
+
+    if model is None:
+        print("❌ Training could not be initialized or failed completely.")
+        return
+        
+    # --- Final Validation ---
     print("\n" + "="*60)
-    print("Loading YOLOv8s-seg pretrained model...")
-    print("="*60 + "\n")
-    
-    model = YOLO('yolov8s-seg.pt')  # Small 모델 (pretrained on COCO)
-    
-    # Fine-tuning 설정
-    print("\n" + "="*60)
-    print("Starting Fine-tuning...")
-    print("="*60 + "\n")
-    
-    results = model.train(
-        data=str(data_yaml),
-        epochs=100,              # Small 모델은 빠르므로 100 epochs 가능
-        imgsz=640,               # 640이 Small에 최적
-        batch=24,                # 16 → 24 (GPU 메모리 여유 있음)
-        patience=20,             # Early stopping patience
-        device=device,
-        workers=8,               # 데이터 로딩 병렬화
-        
-        # Optimizer
-        optimizer='AdamW',       # Fine-tuning에 적합
-        lr0=0.002,              # 0.001 → 0.002 (더 빠른 수렴)
-        lrf=0.01,               # Final learning rate (0.01 * lr0)
-        momentum=0.937,
-        weight_decay=0.0005,
-        
-        # Augmentation (품질 향상을 위해 강화)
-        hsv_h=0.03,             # Hue augmentation (0.015 → 0.03)
-        hsv_s=0.8,              # Saturation (0.7 → 0.8)
-        hsv_v=0.5,              # Value (0.4 → 0.5)
-        degrees=15.0,           # Rotation (0 → 15°) - 다양한 각도
-        translate=0.15,         # Translation (0.1 → 0.15)
-        scale=0.7,              # Scaling (0.5 → 0.7)
-        shear=0.0,              # Shear (불필요)
-        perspective=0.0001,     # Perspective (0 → 0.0001) - 약간 추가
-        flipud=0.0,             # Vertical flip (물건은 상하 반전 없음)
-        fliplr=0.5,             # Horizontal flip 50%
-        mosaic=0.0,             # Mosaic (끄기)
-        mixup=0.0,              # MixUp (끄기)
-        copy_paste=0.1,         # Copy-paste (0 → 0.1) - 약간 추가
-        
-        # Training
-        cos_lr=True,            # Cosine LR scheduler
-        close_mosaic=10,        # Disable mosaic for last N epochs
-        amp=True,               # Automatic Mixed Precision (속도 향상)
-        cache=True,             # 이미지 캐싱 (첫 epoch 후 매우 빠름)
-        
-        # Validation
-        val=True,
-        plots=True,             # Training plots 생성
-        save=True,
-        save_period=10,         # Save checkpoint every 10 epochs
-        
-        # Output
-        project='runs/segment',
-        name='monkey_finetune',
-        exist_ok=True,
-        
-        # Verbose
-        verbose=True,
-        seed=42
-    )
-    
-    print("\n" + "="*60)
-    print("Training completed!")
+    print("Training process finished! Running final validation...")
     print("="*60)
-    print(f"\nBest model saved at: runs/segment/monkey_finetune/weights/best.pt")
-    print(f"Last model saved at: runs/segment/monkey_finetune/weights/last.pt")
-    print(f"Results and plots: runs/segment/monkey_finetune/")
     
-    # Validation on test set
-    print("\n" + "="*60)
-    print("Running final validation...")
-    print("="*60 + "\n")
-    
-    metrics = model.val()
-    
-    print("\nFinal Metrics:")
-    print(f"  mAP50: {metrics.seg.map50:.3f}")
-    print(f"  mAP50-95: {metrics.seg.map:.3f}")
-    print(f"  Precision: {metrics.seg.mp:.3f}")
-    print(f"  Recall: {metrics.seg.mr:.3f}")
-    
-    print("\n" + "="*60)
-    print("To run inference, use:")
-    print("  python inference_webcam.py")
-    print("="*60 + "\n")
+    try:
+        metrics = model.val()
+        
+        print("\nFinal Metrics:")
+        print(f"  mAP50: {metrics.seg.map50:.3f}")
+        print(f"  mAP50-95: {metrics.seg.map:.3f}")
+        print(f"  Precision: {metrics.seg.mp:.3f}")
+        print(f"  Recall: {metrics.seg.mr:.3f}")
+
+    except Exception as e:
+        print(f"🔥🔥🔥 An error occurred during final validation: {e} 🔥🔥🔥")
+
+    print(f"\nBest model saved at: runs/segment/{TRAIN_NAME}/weights/best.pt")
+    print(f"Last model saved at: runs/segment/{TRAIN_NAME}/weights/last.pt")
+    print(f"Results and plots: runs/segment/{TRAIN_NAME}/")
+
 
 if __name__ == "__main__":
     main()

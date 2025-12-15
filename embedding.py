@@ -87,7 +87,7 @@ class EmbeddingManager:
         
         # 캐시되지 않은 텍스트만 임베딩
         if uncached_texts:
-            print(f"  [Embedding] Computing embeddings for {len(uncached_texts)} new labels")
+            # print(f"  [Embedding] Computing embeddings for {len(uncached_texts)} new labels")  # 출력 제거
             new_embeddings = self.embed_texts(uncached_texts)
             
             # 캐시에 저장

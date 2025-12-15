@@ -189,12 +189,15 @@ def test_yolo_generation(
         
         for obj_idx, (obj_image, obj_meta, original_idx) in enumerate(selected_objects):
             try:
-                # 크기: 최소 220px ~ 최대 280px
-                min_dim = min(obj_image.size)
-                min_scale = 220 / min_dim
-                max_scale = 280 / min_dim
-                scale = random.uniform(min_scale, max_scale)
-                rotation = random.uniform(-30, 30)  # -30° ~ +30°
+                # 크기: 긴 쪽을 300-350px로 통일 (일관된 크기 보장)
+                max_dim = max(obj_image.size)
+                target_size = random.uniform(350, 430)
+                scale = target_size / max_dim
+                rotation = random.uniform(-15, 15)  # -15° ~ +15°
+                
+                # 50% 확률로 수평 반전
+                if random.random() < 0.5:
+                    obj_image = obj_image.transpose(Image.FLIP_LEFT_RIGHT)
                 
                 # 합성 (visible_mask 포함)
                 composite_img, occlusion_ratio, visible_mask = composite_on_segment(
@@ -246,11 +249,11 @@ def test_yolo_generation(
                 image_path = images_dir / output_filename
                 blended_img.save(image_path)
                 
-                # 2. YOLO annotation 저장
+                # 2. YOLO annotation 저장 (obj_mask 사용 - 실제 최종 객체 마스크)
                 label_path = labels_dir / output_filename.replace('.png', '.txt')
                 img_width, img_height = blended_img.size
                 annotation_saved = save_yolo_annotation(
-                    visible_mask,
+                    obj_mask,  # obj_mask로 변경 (visible_mask 대신)
                     img_width,
                     img_height,
                     label_path,
@@ -261,10 +264,12 @@ def test_yolo_generation(
                     print(f"    ⚠ Failed to save annotation")
                     continue
                 
-                # 3. Segment 시각화 저장
+                # 3. Segment 시각화 저장 (obj_mask 사용 - annotation과 동일)
+                # obj_mask를 boolean으로 변환
+                obj_mask_bool = obj_mask > 0
                 viz_img = visualize_segment_mask(
                     blended_img,
-                    visible_mask,
+                    obj_mask_bool,  # visible_mask 대신 obj_mask 사용
                     alpha=0.4,
                     color=(0, 255, 0)  # Green overlay
                 )

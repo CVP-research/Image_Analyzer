@@ -21,8 +21,11 @@ import random
 import sys
 import time
 import math
+import logging
 from pathlib import Path
 from typing import Dict, List, Tuple
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -41,6 +44,7 @@ from yolo_utils import (
     create_yolo_dataset_structure,
     split_train_val
 )
+from logging_utils import setup_logger
 
 
 # ============================================================
@@ -60,12 +64,16 @@ def adjust_lighting_and_temperature(
         obj_cv: 객체 이미지 (BGR)
         bg_cv: 배경 이미지 (BGR)
         mask_bin: 객체 마스크
-        brightness_strength: 밝기 조정 강도 (0.2 = 20% 배경 밝기에 맞춤)
-        temperature_strength: 색온도 조정 강도 (0.2 = 20% 배경 색온도에 맞춤)
+        brightness_strength: 밝기 조정 강도 (사용되지 않음, 레거시)
+        temperature_strength: 색온도 조정 강도 (사용되지 않음, 레거시)
     
     Returns:
         조정된 객체 이미지 (BGR)
     """
+    # YOLO 학습 데이터 다양성을 위해 최대 조정 강도를 랜덤화
+    # 30% ~ 80% 사이의 값을 사용
+    max_adjustment_strength = random.uniform(0.3, 0.8)
+
     # 1. 배경 밝기 분석 (Lab의 L 채널)
     bg_lab = cv2.cvtColor(bg_cv, cv2.COLOR_BGR2LAB).astype(np.float32)
     bg_brightness = np.mean(bg_lab[:, :, 0])  # L 채널 평균
@@ -85,29 +93,35 @@ def adjust_lighting_and_temperature(
     else:
         obj_brightness = np.mean(obj_lab[:, :, 0])
     
-    # 4. 밝기 조정 (Lab의 L 채널만)
+    # 4. 밝기 조정 (Lab의 L 채널만) - 지수적으로 적용
     brightness_diff = bg_brightness - obj_brightness
+    # 차이가 클수록 지수적으로 증가, 최대 강도는 랜덤화됨
+    brightness_factor = min(max_adjustment_strength, 1 - np.exp(-abs(brightness_diff) / 30))
     obj_lab[:, :, 0] = np.clip(
-        obj_lab[:, :, 0] + brightness_diff * brightness_strength,
+        obj_lab[:, :, 0] + brightness_diff * brightness_factor,
         0, 255
     )
     
     # Lab → BGR 변환
     obj_adjusted = cv2.cvtColor(obj_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     
-    # 5. 색온도 조정 (R, B 채널만 살짝)
-    if abs(bg_temperature) > 0.05:  # 배경이 확실히 따뜻하거나 차가울 때만
-        temperature_shift = bg_temperature * temperature_strength * 50  # -10 ~ 10 정도
-        
-        obj_adjusted[:, :, 2] = np.clip(
-            obj_adjusted[:, :, 2].astype(np.float32) + temperature_shift,
-            0, 255
-        ).astype(np.uint8)  # Red
-        
-        obj_adjusted[:, :, 0] = np.clip(
-            obj_adjusted[:, :, 0].astype(np.float32) - temperature_shift,
-            0, 255
-        ).astype(np.uint8)  # Blue
+    # 5. 색온도 조정 (R, B 채널) - 지수적으로 적용
+    obj_temperature = (np.mean(obj_adjusted[:, :, 2]) - np.mean(obj_adjusted[:, :, 0])) / 255.0
+    temperature_diff = bg_temperature - obj_temperature
+    
+    # 차이가 클수록 지수적으로 증가, 최대 강도는 랜덤화됨
+    temperature_factor = min(max_adjustment_strength, 1 - np.exp(-abs(temperature_diff) / 0.2))
+    temperature_shift = temperature_diff * temperature_factor * 50  # 최대 ±30 정도
+    
+    obj_adjusted[:, :, 2] = np.clip(
+        obj_adjusted[:, :, 2].astype(np.float32) + temperature_shift,
+        0, 255
+    ).astype(np.uint8)  # Red
+    
+    obj_adjusted[:, :, 0] = np.clip(
+        obj_adjusted[:, :, 0].astype(np.float32) - temperature_shift,
+        0, 255
+    ).astype(np.uint8)  # Blue
     
     return obj_adjusted
 
@@ -381,7 +395,7 @@ def segment_objects(frame_dir: Path) -> None:
             continue
 
         largest_mask = 1 - largest_mask
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((3, 3), np.uint8)
         largest_mask = cv2.erode(largest_mask, kernel, iterations=1)
 
         obj_only = np.zeros_like(img)
@@ -471,11 +485,12 @@ def find_suitable_backgrounds(
 # Poisson blending helper
 # ============================================================
 def blend_object(
-    obj_image: Image.Image, 
+    obj_image: Image.Image,
     bg_image: Image.Image,
     brightness_strength: float = 0.3,
     temperature_strength: float = 0.4,
     max_strength: float = 0.6,  # 최대 60%
+    erode_iterations: int = 1,  # 마스크 침식 반복 횟수
 ):
     """
     Option G: 밝기 + 색온도 조정 + 순수 알파 블렌딩
@@ -517,9 +532,9 @@ def blend_object(
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask_bin = cv2.erode(mask_bin, kernel, iterations=erode_iterations)
     
-    # 알파 채널 부드럽게 (경계 블렌딩)
+    # 알파 채널 부드럽게 (경계 블렌딩) - 최소한만 적용
     mask_float = mask_bin.astype(np.float32) / 255.0
-    mask_float = cv2.GaussianBlur(mask_float, (3, 3), 0.5)
+    mask_float = cv2.GaussianBlur(mask_float, (3, 3), 0.3)
 
     # 밝기 + 색온도 조정
     obj_adjusted = adjust_lighting_and_temperature(
@@ -546,43 +561,113 @@ def blend_object(
                         result[by, bx] * (1 - alpha)
                     ).astype(np.uint8)
     
-    # LAB 변환
-    obj_lab = cv2.cvtColor(np.array(obj_image), cv2.COLOR_RGBA2LAB)
-    bg_lab = cv2.cvtColor(np.array(bg_image), cv2.COLOR_RGBA2LAB)
-    
-    # 밝기 차이 계산
-    brightness_diff = np.mean(bg_lab[:, :, 0]) - np.mean(obj_lab[:, :, 0])
-    # 색온도 차이 계산
-    bg_temperature = np.mean(bg_lab[:, :, 2]) - np.mean(bg_lab[:, :, 1])
-    obj_temperature = np.mean(obj_lab[:, :, 2]) - np.mean(obj_lab[:, :, 1])
-    temperature_diff = bg_temperature - obj_temperature
-    
-    # 밝기/색온도 강도: 차이가 클수록 지수적으로 증가, 최대 max_strength
-    # exp(-|diff|)로 부드럽게, 차이 0이면 거의 변화 없음, 차이 크면 max_strength 근접
-    brightness_factor = min(max_strength, 1 - np.exp(-abs(brightness_diff)/30))
-    temperature_factor = min(max_strength, 1 - np.exp(-abs(temperature_diff)/10))
-    
-    # 적용
-    obj_lab[:, :, 0] = np.clip(
-        obj_lab[:, :, 0] + brightness_diff * brightness_factor,
-        0, 255
-    )
-    obj_lab[:, :, 1] = np.clip(
-        obj_lab[:, :, 1] + temperature_diff * temperature_factor,
-        0, 255
-    )
-    obj_lab[:, :, 2] = np.clip(
-        obj_lab[:, :, 2] + temperature_diff * temperature_factor,
-        0, 255
-    )
-    
-    result = cv2.cvtColor(obj_lab, cv2.COLOR_LAB2RGBA)
-    return Image.fromarray(result)
+    # BGR로 변환 후 반환
+    result_bgra = cv2.cvtColor(result, cv2.COLOR_BGR2BGRA)
+    result_bgra[:, :, 3] = 255  # 완전 불투명
+    return Image.fromarray(cv2.cvtColor(result_bgra, cv2.COLOR_BGRA2RGBA))
 
 
 # ============================================================
 # Step 5: 자연스러운 합성 (동적 목표 달성)
 # ============================================================
+
+def process_single_composite(
+    task: Dict,
+    use_depth: bool,
+    use_lighting: bool,
+    depth_offset: float,
+    occlusion_threshold: float,
+    split_name: str,
+    image_dir: Path,
+    label_dir: Path,
+    yolo_base: Path
+) -> Tuple[Path, int]:
+    """
+    단일 합성 작업 처리 (병렬화용)
+    
+    Returns:
+        (image_path, original_idx) 또는 None (실패 시)
+    """
+    logger = logging.getLogger(__name__)
+    
+    bg_idx = task['bg_idx']
+    bg_info = task['bg_info']
+    obj_image = task['obj_image'].copy()  # 멀티스레드 안전성
+    obj_meta = task['obj_meta']
+    original_idx = task['original_idx']
+    
+    try:
+        # Depth 맵 계산
+        bg_depth_map, averaged_depth_map = None, None
+        if use_depth:
+            _, bg_depth_map = compute_depth(bg_info["bg_image"])
+            from segment import run_segmentation
+            annotations, _ = run_segmentation(bg_info["bg_image"])
+            segments = [{"segmentation": mask} for mask, label in annotations]
+            averaged_depth_map = compute_segment_averaged_depth(bg_depth_map, segments)
+        
+        # 데이터 증강: 크기, 회전, 반전
+        max_dim = max(obj_image.size)
+        target_size = random.uniform(350, 430)
+        scale = target_size / max_dim
+        rotation = random.uniform(-15, 15)
+        if random.random() < 0.5:
+            obj_image = obj_image.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # 합성
+        composite_img, occlusion_ratio, _ = composite_on_segment(
+            bg_info["bg_image"], bg_info["segment_mask"], obj_image,
+            base_scale=scale, use_depth=use_depth,
+            bg_depth_map=averaged_depth_map,
+            depth_offset=depth_offset, rotation_angle=rotation
+        )
+
+        if occlusion_ratio >= occlusion_threshold:
+            return None
+        
+        # 최종 마스크 계산
+        bg_rgb = bg_info["bg_image"].convert("RGB")
+        comp_rgb = composite_img.convert("RGB")
+        bg_cv = cv2.cvtColor(np.array(bg_rgb), cv2.COLOR_RGB2BGR)
+        comp_cv = cv2.cvtColor(np.array(comp_rgb), cv2.COLOR_RGB2BGR)
+        diff_gray = cv2.cvtColor(cv2.absdiff(comp_cv, bg_cv), cv2.COLOR_BGR2GRAY)
+        _, obj_mask = cv2.threshold(diff_gray, 1, 255, cv2.THRESH_BINARY)
+
+        if obj_mask.max() == 0:
+            return None
+        
+        # 조명 조정 및 블렌딩
+        obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
+        obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
+        obj_only_rgba[:, :, 3] = obj_mask
+        obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
+        blended_img = blend_object(obj_cutout, bg_info["bg_image"])
+        
+        # 파일 저장
+        output_filename = f"composite_{split_name}_bg{bg_idx:04d}_obj{original_idx:04d}.png"
+        image_path = image_dir / output_filename
+        label_path = label_dir / output_filename.replace('.png', '.txt')
+        blended_img.save(image_path)
+        
+        # 배경 원본도 저장 (negative sampling용)
+        bg_save_dir = yolo_base / "backgrounds" / split_name
+        bg_save_dir.mkdir(parents=True, exist_ok=True)
+        bg_filename = f"bg{bg_idx:04d}.png"
+        bg_save_path = bg_save_dir / bg_filename
+        if not bg_save_path.exists():  # 중복 저장 방지
+            bg_info["bg_image"].save(bg_save_path)
+        
+        # YOLO 어노테이션 저장
+        if save_yolo_annotation(obj_mask, blended_img.size[0], blended_img.size[1], label_path, class_id=0):
+            return (image_path, original_idx)
+        else:
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error processing bg{bg_idx}_obj{original_idx}: {e}")
+        return None
+
+
 def composite_naturally(
     objects: List[Tuple[Image.Image, Dict]],
     backgrounds: List[Dict],
@@ -591,7 +676,202 @@ def composite_naturally(
     overlay_scale: float = 1.0,
     depth_offset: float = 0.05,
     target_images: int = 1600,
-    occlusion_threshold: float = 0.15,
+    occlusion_threshold: float = 0.3,
+    class_name: str = "object",
+    max_workers: int = 5
+) -> List[Path]:
+    """
+    동적으로 목표 개수에 맞춰 객체를 배경에 합성 (YOLO 데이터셋 형식, 병렬 처리)
+    
+    전략:
+    - 목표: target_images개 생성
+    - 배경 부족 시 → 배경당 객체 개수 자동 증가
+    - 객체 균등 분배 → 모든 객체가 비슷한 횟수로 사용됨
+    - YOLO segmentation format으로 저장 (images/ + labels/)
+    - 병렬 처리로 성능 향상 (max_workers 설정 가능)
+    
+    Args:
+        objects: [(누끼 이미지, 메타데이터)] 리스트
+        backgrounds: 배경 정보 리스트
+        use_depth: Depth 기반 occlusion 사용 여부
+        use_lighting: Lighting 조정 사용 여부 (Option G 적용)
+        overlay_scale: 오버레이 스케일
+        depth_offset: overlay를 앞으로 당길 오프셋 (기본 0.05)
+        target_images: 목표 이미지 개수 (기본 1600)
+        occlusion_threshold: 가려짐 비율 임계값 (0.3 = 30% 이상 가려지면 스킵)
+        class_name: YOLO 클래스 이름 (기본 "object")
+        max_workers: 병렬 처리 워커 수 (기본 7)
+    
+    Returns:
+        저장된 합성 이미지 경로 리스트
+    """
+    
+    # 로거 설정
+    logger, log_file = setup_logger()
+    logger.info(f"Starting composite_naturally (parallel with {max_workers} workers)")
+    logger.info(f"Target images: {target_images}")
+    logger.info(f"Backgrounds: {len(backgrounds)}")
+    logger.info(f"Objects: {len(objects)}")
+    logger.info(f"Use depth: {use_depth}")
+    logger.info(f"Use lighting: {use_lighting}")
+    logger.info(f"YOLO class: {class_name}")
+
+    print(f"\n[Step 5] Compositing objects with parallel processing ({max_workers} workers)...")
+    print(f"  Target: {target_images} images from {len(backgrounds)} backgrounds")
+    
+    if not objects or not backgrounds:
+        logger.error("No objects or backgrounds to process.")
+        print("  Error: No objects or backgrounds to process.")
+        return []
+
+    # YOLO 데이터셋 구조 생성
+    yolo_base = OUTPUT_DIR / "result"
+    images_train, images_val, labels_train, labels_val = create_yolo_dataset_structure(
+        yolo_base, [class_name]
+    )
+
+    # 1. 배경을 train/val로 미리 분리하여 데이터 유출 방지
+    random.shuffle(backgrounds)
+    val_ratio = 0.2
+    val_count = int(len(backgrounds) * val_ratio)
+    if len(backgrounds) > 1 and val_count == 0:  # 최소 1개는 검증용으로
+        val_count = 1
+    
+    train_bgs = backgrounds[val_count:]
+    val_bgs = backgrounds[:val_count]
+    
+    logger.info(f"Splitting backgrounds: {len(train_bgs)} train / {len(val_bgs)} val")
+    print(f"  Splitting backgrounds: {len(train_bgs)} train / {len(val_bgs)} val")
+    print(f"  Occlusion threshold: {occlusion_threshold:.1%}")
+
+    output_paths = []
+    object_usage_count = {i: 0 for i in range(len(objects))}
+    
+    total_generated_images = 0
+
+    # 2. Train/Val 각 세트에 대해 생성 루프 실행
+    dataset_splits = [
+        ("train", train_bgs, images_train, labels_train),
+        ("val", val_bgs, images_val, labels_val),
+    ]
+
+    pbar = tqdm(total=target_images, desc="Generating images", unit="img")
+
+    for split_name, split_bgs, image_dir, label_dir in dataset_splits:
+        if not split_bgs:
+            logger.warning(f"No backgrounds for {split_name} split, skipping.")
+            continue
+        
+        # 해당 스플릿의 목표 이미지 수 계산
+        total_bgs = len(backgrounds)
+        split_ratio = len(split_bgs) / total_bgs if total_bgs > 0 else 0
+        
+        # val 셋에 최소 1개 이상의 bg가 할당되었을 때, val_ratio가 0이 되는 것을 방지
+        if split_name == 'val' and val_count > 0 and total_bgs > 0:
+            actual_val_ratio = val_count / total_bgs
+            target_split_images = int(target_images * actual_val_ratio)
+        else:
+            target_split_images = int(target_images * split_ratio)
+
+        # val set에 bg가 있는데 target image가 0개이면 최소 1개 생성
+        if target_split_images == 0 and len(split_bgs) > 0:
+            target_split_images = 1
+
+        objects_per_bg = max(1, int(target_split_images / len(split_bgs))) if len(split_bgs) > 0 else 1
+        
+        logger.info(f"Generating {split_name} set (target: ~{target_split_images} images)...")
+        logger.info(f"  - Using {len(split_bgs)} backgrounds, ~{objects_per_bg} objects per background.")
+        logger.info(f"  - Parallel workers: {max_workers}")
+        
+        current_split_image_count = 0
+
+        # 작업 리스트 생성 (배경 + 객체 조합)
+        tasks = []
+        for bg_idx, bg_info in enumerate(split_bgs):
+            if current_split_image_count >= target_split_images:
+                break
+            if total_generated_images >= target_images:
+                break
+
+            # 객체 선택 (사용 횟수 적은 순)
+            sorted_obj_indices = sorted(object_usage_count.keys(), key=lambda x: object_usage_count[x])
+            selected_indices = sorted_obj_indices[:min(objects_per_bg, len(objects))]
+            
+            for obj_idx in selected_indices:
+                tasks.append({
+                    'bg_idx': bg_idx,
+                    'bg_info': bg_info,
+                    'obj_idx': obj_idx,
+                    'obj_image': objects[obj_idx][0],
+                    'obj_meta': objects[obj_idx][1],
+                    'original_idx': obj_idx
+                })
+        
+        # 병렬 처리
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {
+                executor.submit(
+                    process_single_composite,
+                    task,
+                    use_depth,
+                    use_lighting,
+                    depth_offset,
+                    occlusion_threshold,
+                    split_name,
+                    image_dir,
+                    label_dir,
+                    yolo_base
+                ): task
+                for task in tasks
+            }
+            
+            for future in as_completed(future_to_task):
+                task = future_to_task[future]
+                
+                try:
+                    result = future.result()
+                    if result is not None:
+                        image_path, original_idx = result
+                        output_paths.append(image_path)
+                        current_split_image_count += 1
+                        total_generated_images += 1
+                        object_usage_count[original_idx] += 1
+                        pbar.update(1)
+                        pbar.set_postfix({"split": split_name})
+                        
+                        # 목표 달성 시 중단
+                        if current_split_image_count >= target_split_images or total_generated_images >= target_images:
+                            for f in future_to_task:
+                                f.cancel()
+                            break
+                            
+                except Exception as e:
+                    logger.error(f"Error processing task: {e}", exc_info=True)
+
+    
+    pbar.close()
+    logger.info(f"\nGenerated {len(output_paths)} total composite images")
+    print(f"\n\n✓ Generated {len(output_paths)} total composite images")
+    
+    if any(object_usage_count.values()):
+        min_usage = min(object_usage_count.values())
+        max_usage = max(object_usage_count.values())
+        avg_usage = sum(object_usage_count.values()) / len(object_usage_count)
+        logger.info(f"Object usage: min={min_usage}, max={max_usage}, avg={avg_usage:.1f}")
+        print(f"  Object usage: min={min_usage}, max={max_usage}, avg={avg_usage:.1f}")
+    
+    return output_paths
+
+
+def composite_naturally_old(
+    objects: List[Tuple[Image.Image, Dict]],
+    backgrounds: List[Dict],
+    use_depth: bool = False,
+    use_lighting: bool = False,
+    overlay_scale: float = 1.0,
+    depth_offset: float = 0.05,
+    target_images: int = 1600,
+    occlusion_threshold: float = 0.3,
     class_name: str = "object"
 ) -> List[Path]:
     """
@@ -618,186 +898,137 @@ def composite_naturally(
         저장된 합성 이미지 경로 리스트
     """
     
-    print(f"\n[Step 5] Compositing objects naturally with dynamic allocation...")
+    print(f"\n[Step 5] Compositing objects naturally with clean train/val split...")
     print(f"  Target images: {target_images}")
-    print(f"  Backgrounds: {len(backgrounds)}")
+    print(f"  Total backgrounds: {len(backgrounds)}")
     print(f"  Objects: {len(objects)}")
     print(f"  Use depth: {use_depth}")
     print(f"  Use lighting: {use_lighting}")
     print(f"  YOLO class: {class_name}")
-    
+
+    if not objects or not backgrounds:
+        print("  Error: No objects or backgrounds to process.")
+        return []
+
     # YOLO 데이터셋 구조 생성
     yolo_base = OUTPUT_DIR / "result"
     images_train, images_val, labels_train, labels_val = create_yolo_dataset_structure(
-        yolo_base,
-        [class_name]
+        yolo_base, [class_name]
     )
+
+    # 1. 배경을 train/val로 미리 분리
+    random.shuffle(backgrounds)
+    val_ratio = 0.2
+    val_count = int(len(backgrounds) * val_ratio)
+    if len(backgrounds) > 1 and val_count == 0:  # 최소 1개는 검증용으로
+        val_count = 1
     
-    # 동적 배치 계산
-    if len(backgrounds) == 0:
-        print("  Error: No backgrounds found!")
-        return []
+    train_bgs = backgrounds[val_count:]
+    val_bgs = backgrounds[:val_count]
     
-    # 배경당 객체 개수 계산 (목표 달성하도록)
-    objects_per_bg = max(1, int(target_images / len(backgrounds)))
-    
-    # 너무 많으면 제한 (한 배경에 최대 5개)
-    if objects_per_bg > 5:
-        objects_per_bg = 5
-        print(f"  ⚠ Limiting to {objects_per_bg} objects per background (too many backgrounds)")
-    
-    print(f"  Calculated: {objects_per_bg} objects per background")
-    print(f"  Expected: {len(backgrounds)} × {objects_per_bg} = {len(backgrounds) * objects_per_bg} images")
+    print(f"  Splitting backgrounds: {len(train_bgs)} train / {len(val_bgs)} val")
     print(f"  Occlusion threshold: {occlusion_threshold:.1%}")
-    
+
     output_paths = []
-    
-    # 객체 사용 횟수 추적 (균등 분배용)
     object_usage_count = {i: 0 for i in range(len(objects))}
-    
-    for bg_idx, bg_info in enumerate(backgrounds):
-        # 목표 달성 여부 체크
-        if len(output_paths) >= target_images:
-            print(f"\n  ✓ Target reached: {len(output_paths)} images")
-            break
+
+    # 2. Train/Val 각 세트에 대해 생성 루프 실행
+    dataset_splits = [
+        ("train", train_bgs, images_train, labels_train),
+        ("val", val_bgs, images_val, labels_val),
+    ]
+
+    for split_name, split_bgs, image_dir, label_dir in dataset_splits:
+        if not split_bgs:
+            print(f"\nNo backgrounds for {split_name} split, skipping.")
+            continue
         
-        # 사용 횟수 적은 객체 우선 선택 (균등 분배)
-        sorted_obj_indices = sorted(object_usage_count.keys(), key=lambda x: object_usage_count[x])
-        selected_indices = sorted_obj_indices[:min(objects_per_bg, len(objects))]
-        selected_objects = [(objects[i][0], objects[i][1], i) for i in selected_indices]
-        # 사용 횟수 적은 객체 우선 선택 (균등 분배)
-        sorted_obj_indices = sorted(object_usage_count.keys(), key=lambda x: object_usage_count[x])
-        selected_indices = sorted_obj_indices[:min(objects_per_bg, len(objects))]
-        selected_objects = [(objects[i][0], objects[i][1], i) for i in selected_indices]
+        # 해당 스플릿의 목표 이미지 수 계산
+        split_ratio = len(split_bgs) / len(backgrounds) if len(backgrounds) > 0 else 0
+        target_split_images = int(target_images * split_ratio) if split_name == 'train' else int(target_images * val_ratio)
+
+        if target_split_images == 0 and len(split_bgs) > 0:
+            target_split_images = 1 # Ensure at least one image is generated for val if there are val backgrounds
+
+        objects_per_bg = max(1, int(target_split_images / len(split_bgs))) if len(split_bgs) > 0 else 1
         
-        print(f"\n  Background {bg_idx+1}/{len(backgrounds)}: Selected {len(selected_objects)} objects")
+        print(f"\nGenerating {split_name} set (target: ~{target_split_images} images)...")
+        print(f"  - Using {len(split_bgs)} backgrounds, ~{objects_per_bg} objects per background.")
         
-        # Depth 계산 (use_depth=True일 때만)
-        bg_depth_map = None
-        averaged_depth_map = None
-        if use_depth:
-            print(f"    Computing depth...")
-            _, bg_depth_map = compute_depth(bg_info["bg_image"])
-            print(f"    Depth range: [{bg_depth_map.min():.2f}, {bg_depth_map.max():.2f}]")
-            
-            # Segment별 평균 depth map 계산
-            from segment import run_segmentation
-            annotations, _ = run_segmentation(bg_info["bg_image"])
-            
-            # annotations를 Dict 형식으로 변환 (segmentation 키 필요)
-            segments = [{"segmentation": mask} for mask, label in annotations]
-            
-            # 평균화된 depth map 생성
-            averaged_depth_map = compute_segment_averaged_depth(bg_depth_map, segments)
-        
-        for obj_idx, (obj_image, obj_meta, original_idx) in enumerate(selected_objects):
-            # 목표 달성 체크
-            if len(output_paths) >= target_images:
+        current_split_image_count = 0
+
+        for bg_idx, bg_info in enumerate(split_bgs):
+            if current_split_image_count >= target_split_images:
                 break
-                
-            try:
-                # 크기: 최소 220px ~ 최대 280px
-                min_dim = min(obj_image.size)
-                min_scale = 220 / min_dim
-                max_scale = 280 / min_dim
-                scale = random.uniform(min_scale, max_scale)
-                rotation = random.uniform(-30, 30)  # -30° ~ +30°
-                
-                # 합성 (평균화된 depth map 사용) - visible_mask도 반환받음
-                composite_img, occlusion_ratio, visible_mask = composite_on_segment(
-                    bg_info["bg_image"],
-                    bg_info["segment_mask"],
-                    obj_image,
-                    base_scale=scale,
-                    use_depth=use_depth,
-                    bg_depth_map=averaged_depth_map if use_depth else None,
-                    depth_offset=depth_offset,
-                    rotation_angle=rotation
-                )
-                
-                # 가려짐이 임계값 이상이면 스킵
-                if occlusion_ratio >= occlusion_threshold:
-                    print(f"    ⊗ Object {obj_idx+1}: {occlusion_ratio:.1%} occluded (>= {occlusion_threshold:.1%}), skipping")
-                    continue
-                
-                print(f"    ✓ Object {obj_idx+1}: {occlusion_ratio:.1%} occluded, compositing...")
-                
-                # Composite vs background diff -> object mask
-                bg_rgb = bg_info["bg_image"].convert("RGB")
-                comp_rgb = composite_img.convert("RGB")
-
-                bg_cv = cv2.cvtColor(np.array(bg_rgb), cv2.COLOR_RGB2BGR)
-                comp_cv = cv2.cvtColor(np.array(comp_rgb), cv2.COLOR_RGB2BGR)
-
-                diff_gray = cv2.cvtColor(cv2.absdiff(comp_cv, bg_cv), cv2.COLOR_BGR2GRAY)
-                _, obj_mask = cv2.threshold(diff_gray, 1, 255, cv2.THRESH_BINARY)
-
-                if obj_mask.max() == 0:
-                    print(f"    ⚠ Object {obj_idx+1}: No difference detected, skipping")
-                    continue
-                
-                # 객체 추출 및 Option G 블렌딩
-                obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
-                obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
-                obj_only_rgba[:, :, 3] = obj_mask
-                obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
-                blended_img = blend_object(obj_cutout, bg_info["bg_image"])
-                
-                depth_suffix = "_depth" if use_depth else ""
-                output_filename = (
-                    f"composite_bg{bg_idx:04d}_obj{original_idx:04d}_"
-                    f"{bg_info['segment_label'].replace(' ', '_')}{depth_suffix}.png"
-                )
-                
-                # Train/Val split (80/20)
-                # Global 이미지 번호로 결정 (일관성)
-                is_train = (len(output_paths) % 5) != 0  # 80% train, 20% val
-                
-                if is_train:
-                    image_path = images_train / output_filename
-                    label_path = labels_train / output_filename.replace('.png', '.txt')
-                else:
-                    image_path = images_val / output_filename
-                    label_path = labels_val / output_filename.replace('.png', '.txt')
-                
-                # 이미지 저장
-                blended_img.save(image_path)
-                
-                # YOLO annotation 저장 (visible_mask 사용)
-                img_width, img_height = blended_img.size
-                annotation_saved = save_yolo_annotation(
-                    visible_mask,
-                    img_width,
-                    img_height,
-                    label_path,
-                    class_id=0
-                )
-                
-                if not annotation_saved:
-                    print(f"    ⚠ Failed to save annotation, skipping")
-                    continue
-                
-                output_paths.append(image_path)
-                
-                # 사용 횟수 증가
-                object_usage_count[original_idx] += 1
-                
-                split_name = "train" if is_train else "val"
-                print(f"      Saved: {output_filename} [{split_name}] (Total: {len(output_paths)}/{target_images})")
+        
+            sorted_obj_indices = sorted(object_usage_count.keys(), key=lambda x: object_usage_count[x])
+            selected_indices = sorted_obj_indices[:min(objects_per_bg, len(objects))]
+            selected_objects = [(objects[i][0], objects[i][1], i) for i in selected_indices]
             
-            except Exception as e:
-                print(f"    ✗ Error: obj{obj_idx+1}: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+            bg_depth_map, averaged_depth_map = None, None
+            if use_depth:
+                _, bg_depth_map = compute_depth(bg_info["bg_image"])
+                from segment import run_segmentation
+                annotations, _ = run_segmentation(bg_info["bg_image"])
+                segments = [{"segmentation": mask} for mask, label in annotations]
+                averaged_depth_map = compute_segment_averaged_depth(bg_depth_map, segments)
+            
+            for obj_idx, (obj_image, obj_meta, original_idx) in enumerate(selected_objects):
+                if current_split_image_count >= target_split_images:
+                    break
+                    
+                try:
+                    min_dim = min(obj_image.size)
+                    scale = random.uniform(330 / min_dim, 400 / min_dim)
+                    rotation = random.uniform(-30, 30)
+                    
+                    composite_img, occlusion_ratio, visible_mask = composite_on_segment(
+                        bg_info["bg_image"], bg_info["segment_mask"], obj_image,
+                        base_scale=scale, use_depth=use_depth,
+                        bg_depth_map=averaged_depth_map,
+                        depth_offset=depth_offset, rotation_angle=rotation
+                    )
+
+                    if occlusion_ratio >= occlusion_threshold:
+                        continue
+                    
+                    bg_rgb = bg_info["bg_image"].convert("RGB")
+                    comp_rgb = composite_img.convert("RGB")
+                    bg_cv = cv2.cvtColor(np.array(bg_rgb), cv2.COLOR_RGB2BGR)
+                    comp_cv = cv2.cvtColor(np.array(comp_rgb), cv2.COLOR_RGB2BGR)
+                    diff_gray = cv2.cvtColor(cv2.absdiff(comp_cv, bg_cv), cv2.COLOR_BGR2GRAY)
+                    _, obj_mask = cv2.threshold(diff_gray, 1, 255, cv2.THRESH_BINARY)
+
+                    if obj_mask.max() == 0: continue
+                    
+                    obj_only = cv2.bitwise_and(comp_cv, comp_cv, mask=obj_mask)
+                    obj_only_rgba = cv2.cvtColor(obj_only, cv2.COLOR_BGR2BGRA)
+                    obj_only_rgba[:, :, 3] = obj_mask
+                    obj_cutout = Image.fromarray(cv2.cvtColor(obj_only_rgba, cv2.COLOR_BGRA2RGBA))
+                    blended_img = blend_object(obj_cutout, bg_info["bg_image"])
+                    
+                    output_filename = f"composite_{split_name}_bg{bg_idx:04d}_obj{original_idx:04d}.png"
+                    image_path = image_dir / output_filename
+                    label_path = label_dir / output_filename.replace('.png', '.txt')
+
+                    blended_img.save(image_path)
+                    
+                    if save_yolo_annotation(visible_mask, blended_img.size[0], blended_img.size[1], label_path, class_id=0):
+                        output_paths.append(image_path)
+                        current_split_image_count += 1
+                        object_usage_count[original_idx] += 1
+                        print(f"      Saved: {output_filename} (Total: {len(output_paths)})", end='\r')
+                    
+                except Exception as e:
+                    print(f"\n    ✗ Error on obj {obj_idx+1} in {split_name}: {e}")
+
+    print(f"\n\n✓ Generated {len(output_paths)} total composite images")
     
-    print(f"\n✓ Generated {len(output_paths)} composite images")
-    
-    # 객체 사용 통계
-    min_usage = min(object_usage_count.values())
-    max_usage = max(object_usage_count.values())
-    avg_usage = sum(object_usage_count.values()) / len(object_usage_count)
-    print(f"  Object usage: min={min_usage}, max={max_usage}, avg={avg_usage:.1f}")
+    if any(object_usage_count.values()):
+        min_usage = min(object_usage_count.values())
+        max_usage = max(object_usage_count.values())
+        avg_usage = sum(object_usage_count.values()) / len(object_usage_count)
+        print(f"  Object usage: min={min_usage}, max={max_usage}, avg={avg_usage:.1f}")
     
     return output_paths
 

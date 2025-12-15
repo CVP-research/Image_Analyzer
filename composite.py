@@ -296,7 +296,7 @@ def compute_segment_depth(
     # 오버레이를 segment보다 약간 앞에 배치 (더 큰 값 = 더 가까움)
     overlay_depth = min(1.0, segment_depth_norm + depth_offset)
     
-    print(f"    Segment depth: {segment_depth_norm:.3f} → Overlay depth: {overlay_depth:.3f} (offset: +{depth_offset})")
+    # print(f"    Segment depth: {segment_depth_norm:.3f} → Overlay depth: {overlay_depth:.3f} (offset: +{depth_offset})")
     
     return overlay_depth
 
@@ -346,39 +346,14 @@ def composite_on_segment(
         segment_height = segment_max_y - segment_min_y
     
     # 오버레이 스케일 자동 계산
-    # segment 크기의 90% 정도로 맞춤 (base_scale 적용)
+    # base_scale을 그대로 사용 (caller에서 원하는 크기 지정)
     overlay_w, overlay_h = overlay_image.size
     
-    # 220~280px 크기 보장 (base_scale 적용)
-    min_size = 220
-    max_size = 280
-    
-    # base_scale을 기본으로 사용 (이미 180~220px 범위로 계산됨)
+    # base_scale을 절대 크기로 사용 (Segment 크기 무시)
     auto_scale = base_scale
     
-    # 먼저 최소 크기 보장 확인
-    min_dim_target = min(overlay_w * auto_scale, overlay_h * auto_scale)
-    if min_dim_target < min_size:
-        auto_scale = min_size / min(overlay_w, overlay_h)
-    
-    # Segment보다 너무 크면 segment에 맞춘 후, 다시 최소 크기 체크
-    scale_x = (segment_width * 0.9) / (overlay_w * auto_scale)
-    scale_y = (segment_height * 0.9) / (overlay_h * auto_scale)
-    
-    if scale_x < 1.0 or scale_y < 1.0:
-        # Segment에 맞춰 축소
-        segment_scale = auto_scale * min(scale_x, scale_y)
-        
-        # 축소 후에도 최소 크기 반드시 보장
-        min_dim_after = min(overlay_w * segment_scale, overlay_h * segment_scale)
-        if min_dim_after < min_size:
-            # 최소 크기보다 작아지면 segment 무시하고 최소 크기 우선
-            auto_scale = min_size / min(overlay_w, overlay_h)
-        else:
-            auto_scale = segment_scale
-    
-    # 최종 안전 제한
-    auto_scale = np.clip(auto_scale, 0.15, 3.0)
+    # 최종 안전 제한: 최대 1.2배까지만 (과도한 확대 방지)
+    auto_scale = np.clip(auto_scale, 0.15, 1.2)
     
     if auto_scale != 1.0:
         new_w = int(overlay_w * auto_scale)
@@ -430,7 +405,7 @@ def composite_on_segment(
         center_y = random.randint(valid_min_y, valid_max_y)
     
     rotation_str = f", Rot: {rotation_angle:.1f}°" if rotation_angle != 0 else ""
-    print(f"    Segment: {segment_width}x{segment_height}, Scale: {auto_scale:.2f}, Final: {final_w}x{final_h}px, Pos: ({center_x},{center_y}){rotation_str}")
+    # print(f"    Segment: {segment_width}x{segment_height}, Scale: {auto_scale:.2f}, Final: {final_w}x{final_h}px, Pos: ({center_x},{center_y}){rotation_str}")
     
     # 합성 (adaptive depth offset)
     occlusion_ratio = 0.0
@@ -458,7 +433,7 @@ def composite_on_segment(
             # 가려짐이 70% 이상이면 offset 증가해서 재시도
             if occlusion_ratio > 0.7 and attempt < max_attempts - 1:
                 current_offset += 0.1
-                print(f"    → Occlusion too high, retrying with offset={current_offset:.2f}")
+                # print(f"    → Occlusion too high, retrying with offset={current_offset:.2f}")
             else:
                 break
         

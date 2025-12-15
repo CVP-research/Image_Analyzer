@@ -4,6 +4,12 @@ import cv2
 from transformers import pipeline
 import colorsys
 from ultralytics import SAM
+import warnings
+import logging
+
+# 경고 메시지 억제
+warnings.filterwarnings("ignore", message=".*label_ids_to_fuse.*")
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 # Global SAM model cache
 SAM_MODEL = None
