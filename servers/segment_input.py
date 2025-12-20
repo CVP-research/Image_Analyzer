@@ -11,15 +11,15 @@ from pathlib import Path
 import time
 import json 
 import uvicorn
-import argparse
+from tqdm import tqdm
 
 # ==========================================
 # 1. 설정 및 전역 변수
 # ==========================================
 
-# 전역 변수로 경로를 저장 (명령줄 인자로부터 채워짐)
-INPUT_FRAMES_DIR: Optional[Path] = None
-MASKED_FRAMES_DIR: Optional[Path] = None
+# 환경 변수로 경로 받기 (main.py에서 설정)
+INPUT_FRAMES_DIR = Path(os.environ.get("SEGMENT_INPUT_DIR", "./input"))
+MASKED_FRAMES_DIR = Path(os.environ.get("SEGMENT_OUTPUT_DIR", "./output/masked_frames"))
 
 # 메모리 캐시
 MASK_CACHE: Dict[int, Dict[str, Any]] = {} 
@@ -37,8 +37,9 @@ def get_sam_model():
     if SAM_MODEL is None:
         try:
             print("Loading SAM model...")
-            # Consider making model path also an argument if needed
-            SAM_MODEL = SAM("sam_l.pt") 
+            # 프로젝트 루트 기준 경로 사용
+            sam_path = Path(__file__).parent.parent / "sam2_l.pt"
+            SAM_MODEL = SAM(str(sam_path)) 
             print("SAM model loaded.")
         except Exception as e:
             print(f"❌ FATAL ERROR: SAM 모델 로드 실패. 경로 확인: {e}")
@@ -79,22 +80,23 @@ def extract_clean_object(img: np.ndarray, binary_mask: np.ndarray) -> np.ndarray
 
 def pre_segment_all_frames():
     """시작 시 모든 프레임을 분할하고 캐싱"""
-    global FRAME_ID_COUNTER, INPUT_FRAMES_DIR
+    global FRAME_ID_COUNTER
     print("\n--- 🚀 모든 프레임 사전 분할 작업 시작 ---")
     if get_sam_model() is None: return
-    if INPUT_FRAMES_DIR is None:
-        print("❌ 오류: 입력 디렉터리가 설정되지 않았습니다.")
-        return
 
-    frame_paths = sorted(list(INPUT_FRAMES_DIR.glob("*.jpg")) + list(INPUT_FRAMES_DIR.glob("*.png")))
+    # jpg, jpeg, png 모두 지원
+    frame_paths = sorted(
+        list(INPUT_FRAMES_DIR.glob("*.jpg")) + 
+        list(INPUT_FRAMES_DIR.glob("*.jpeg")) + 
+        list(INPUT_FRAMES_DIR.glob("*.png"))
+    )
     if not frame_paths:
-        print(f"❌ 오류: {INPUT_FRAMES_DIR}에서 프레임을 찾을 수 없습니다.")
+        print(f"❌ 오류: {INPUT_FRAMES_DIR}에서 이미지를 찾을 수 없습니다.")
         return
 
-    print(f"✅ 총 {len(frame_paths)}개의 프레임을 순차적으로 분할합니다.")
     start_time = time.time()
     
-    for frame_path in frame_paths:
+    for frame_path in tqdm(frame_paths, desc="🔄 이미지 분할 중", unit="장", ncols=80):
         image_np = cv2.imread(str(frame_path))
         if image_np is None: continue
         
@@ -109,7 +111,7 @@ def pre_segment_all_frames():
         }
         FRAME_ID_COUNTER += 1
         
-    print(f"--- ✅ 사전 분할 완료! 총 {FRAME_ID_COUNTER}개 프레임 캐싱 ({time.time() - start_time:.2f}초) ---")
+    print(f"\n--- ✅ 사전 분할 완료! 총 {FRAME_ID_COUNTER}개 프레임 캐싱 ({time.time() - start_time:.2f}초) ---")
 
 
 # ==========================================
@@ -117,15 +119,19 @@ def pre_segment_all_frames():
 # ==========================================
 
 app = FastAPI()
-templates = Jinja2Templates(directory=Path(__file__).parent.parent / "templates")
+
+# templates 디렉토리 절대 경로 설정
+BASE_DIR = Path(__file__).parent
+TEMPLATES_DIR = BASE_DIR / "segment_input_templates"
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 @app.on_event("startup")
 async def startup_event():
     """서버 시작 시 실행: 폴더 생성 및 사전 분할"""
-    global MASKED_FRAMES_DIR
     print("--- FastAPI App 시작, 사전 분할 실행 ---")
-    if MASKED_FRAMES_DIR:
-        MASKED_FRAMES_DIR.mkdir(exist_ok=True)
+    print(f"  입력 디렉토리: {INPUT_FRAMES_DIR}")
+    print(f"  출력 디렉토리: {MASKED_FRAMES_DIR}")
+    MASKED_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
     pre_segment_all_frames()
     if FRAME_ID_COUNTER == 0:
         print("\n--- ⚠️ 경고: 캐시된 프레임이 없습니다. ---")
@@ -147,6 +153,7 @@ async def select_object_page(request: Request, frame_id: int):
     
     cache = MASK_CACHE[frame_id]
     
+    # 순차 탐색을 위한 ID 계산
     frame_ids = sorted(MASK_CACHE.keys())
     current_index = frame_ids.index(frame_id)
     prev_id = frame_ids[current_index - 1] if current_index > 0 else None
@@ -175,7 +182,6 @@ async def get_image(frame_id: int):
 @app.post("/save/{frame_id}/{mask_index}")
 async def save_object(frame_id: int, mask_index: int):
     """선택된 객체를 서버의 'masked_frames' 폴더에 PNG로 저장"""
-    global MASKED_FRAMES_DIR
     if frame_id not in MASK_CACHE:
         return JSONResponse({"status": "error", "message": "Frame ID not found"}, status_code=404)
     
@@ -186,10 +192,8 @@ async def save_object(frame_id: int, mask_index: int):
     original_image = cache['image_np']
     selected_mask = cache['masks'][mask_index]
     
+    # 파일명은 원본 이름과 마스크 인덱스를 조합
     output_filename = f"{cache['frame_name']}.png"
-    if MASKED_FRAMES_DIR is None:
-        return JSONResponse({"status": "error", "message": "Output directory not set"}, status_code=500)
-        
     output_path = MASKED_FRAMES_DIR / output_filename
     
     try:
@@ -201,24 +205,32 @@ async def save_object(frame_id: int, mask_index: int):
         print(f"❌ Failed to save mask: {e}")
         return JSONResponse({"status": "error", "message": "Failed to save file."}, status_code=500)
 
+
+@app.post("/api/complete")
+async def complete_and_shutdown():
+    """작업 완료 신호를 받고 서버 종료"""
+    import os
+    import signal
+    
+    saved_count = len(list(MASKED_FRAMES_DIR.glob("*.png")))
+    print(f"\n🎉 세그멘테이션 완료! {saved_count}개 이미지 저장됨")
+    print("--- 서버 종료 중... ---")
+    
+    # 서버 종료 (현재 프로세스에 SIGTERM 전송)
+    os.kill(os.getpid(), signal.SIGTERM)
+    
+    return JSONResponse({"status": "success", "message": "Server shutting down", "saved_count": saved_count})
+
 # ==========================================
 # 5. 스크립트 메인 실행부
 # ==========================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="FastAPI server for SAM-based object segmentation.")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to run the server on.")
-    parser.add_argument("--port", type=int, default=8000, help="Port to run the server on.")
-    parser.add_argument("--input_dir", type=Path, required=True, help="Directory containing input frames.")
-    parser.add_argument("--output_dir", type=Path, required=True, help="Directory to save masked frames.")
-    
-    args = parser.parse_args()
-
-    # 전역 변수 설정
-    INPUT_FRAMES_DIR = args.input_dir
-    MASKED_FRAMES_DIR = args.output_dir
-
-    print(f"--- Uvicorn 서버 직접 실행 ---")
+    import uvicorn
+    print("=" * 60)
+    print("Segmentation Server (SAM 기반 누끼 따기)")
+    print("=" * 60)
     print(f"Input directory: {INPUT_FRAMES_DIR}")
     print(f"Output directory: {MASKED_FRAMES_DIR}")
-    
-    uvicorn.run("segment_server:app", host=args.host, port=args.port, log_level="info", reload=False)
+    print(f"Server: http://0.0.0.0:8001")
+    print("=" * 60)
+    uvicorn.run("segment_input:app", host="0.0.0.0", port=8001, reload=False)

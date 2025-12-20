@@ -16,12 +16,12 @@ Few-shot Semantic Compositing Pipeline - Main Entry Point
 - semantic_matcher.py: 의미론적 배경 매칭
 """
 
-import sys
-from pathlib import Path
-
 # =============================================================================
 # 빠른 CLI 인자 파싱 (의존성 체크 전에 --debug 확인)
 # =============================================================================
+import sys
+
+
 def _quick_parse_args():
     """의존성 체크 전에 --debug, --help 확인"""
     # 간단히 sys.argv 확인
@@ -31,82 +31,11 @@ def _quick_parse_args():
 # 디버그 모드 여부 (의존성 체크 스킵용)
 _DEBUG_EARLY = _quick_parse_args()
 
-
-# =============================================================================
-# 의존성 체크 (프로그램 시작 전 필수 패키지 확인)
-# =============================================================================
-def check_dependencies(skip_heavy: bool = False):
-    """
-    필수 의존성이 설치되어 있는지 확인
-
-    Args:
-        skip_heavy: True면 무거운 패키지(GPU, API 관련) 체크 스킵
-    """
-    # 기본 패키지 (항상 필요)
-    base_packages = {
-        "cv2": "opencv-python",
-        "numpy": "numpy",
-        "PIL": "pillow",
-        "tqdm": "tqdm",
-        "yaml": "pyyaml",
-    }
-
-    # 무거운 패키지 (디버그 모드에서는 스킵 가능)
-    heavy_packages = {
-        "torch": "torch",
-        "torchvision": "torchvision",
-        "transformers": "transformers",
-        "ultralytics": "ultralytics",
-        "sentence_transformers": "sentence-transformers",
-        "scipy": "scipy",
-        "timm": "timm",
-        "skimage": "scikit-image",
-        "gradio": "gradio",
-        "google.genai": "google-genai",
-    }
-
-    # 체크할 패키지 결정
-    if skip_heavy:
-        required_packages = base_packages
-    else:
-        required_packages = {**base_packages, **heavy_packages}
-
-    missing = []
-    for import_name, package_name in required_packages.items():
-        try:
-            __import__(import_name)
-        except ImportError:
-            missing.append(package_name)
-
-    if missing:
-        print("=" * 60)
-        print("ERROR: 필수 의존성이 설치되지 않았습니다!")
-        print("=" * 60)
-        print("\n누락된 패키지:")
-        for pkg in missing:
-            print(f"  - {pkg}")
-        print("\n설치 방법:")
-        print(f"  pip install {' '.join(missing)}")
-        print("\n또는 전체 의존성 설치:")
-        print("  pip install -r requirements.txt")
-        if not skip_heavy:
-            print("\n(디버그 모드로 실행하려면: python pipeline/run.py --debug)")
-        print("=" * 60)
-        sys.exit(1)
-
-    if skip_heavy:
-        print("✓ 기본 의존성 확인됨 (DEBUG 모드: 무거운 패키지 스킵)")
-    else:
-        print("✓ 모든 필수 의존성이 설치되어 있습니다.")
-
-
-# 의존성 체크 실행 (디버그 모드면 무거운 패키지 스킵)
-check_dependencies(skip_heavy=_DEBUG_EARLY)
-
 # =============================================================================
 # Job 선택 시스템
 # =============================================================================
 from datetime import datetime
+from pathlib import Path
 
 JOBS_DIR = Path(__file__).resolve().parent / "jobs"
 
@@ -1255,28 +1184,6 @@ def composite_naturally_old(
     
     return output_paths
 
-
-
-
-# ============================================================
-# 전역 디버그 모드 플래그
-# ============================================================
-DEBUG_MODE = False
-
-
-def set_debug_mode(enabled: bool):
-    """디버그 모드 설정"""
-    global DEBUG_MODE
-    DEBUG_MODE = enabled
-    if enabled:
-        print("\n" + "!" * 60)
-        print("  DEBUG MODE ENABLED")
-        print("  - 무거운 모델 로딩 스킵")
-        print("  - API 호출 시뮬레이션")
-        print("  - GPU 연산 스킵")
-        print("!" * 60 + "\n")
-
-
 # ============================================================
 # 전체 파이프라인 실행 함수
 # ============================================================
@@ -1489,138 +1396,3 @@ def run_full_pipeline(
     print("=" * 60)
     
     return output_paths
-
-
-def main():
-    """
-    메인 엔트리 포인트
-
-    전체 파이프라인:
-    1. 입력 이미지 로드
-    1.5. 카메라 포즈 등록 (Gradio UI)
-    1.8. 뷰 선택
-    2. Veo3로 360도 뷰 영상 생성
-    3. 객체 segmentation
-    4. 의미론적으로 적합한 배경 찾기
-    5. 자연스러운 합성 (depth, lighting)
-    """
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Few-shot Semantic Compositing Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python pipeline/run.py                 # 일반 실행
-  python pipeline/run.py --debug         # 디버그 모드 (무거운 연산 스킵)
-  python pipeline/run.py --debug --new   # 디버그 + 새 job 자동 생성
-        """
-    )
-    parser.add_argument(
-        "--debug", "-d",
-        action="store_true",
-        help="디버그 모드: 모델 로딩, API 호출, GPU 연산 스킵"
-    )
-    parser.add_argument(
-        "--new", "-n",
-        action="store_true",
-        help="새 job 자동 생성 (선택 프롬프트 스킵)"
-    )
-    parser.add_argument(
-        "--job",
-        type=str,
-        default=None,
-        help="특정 job 이름 지정 (예: 20231220_143052)"
-    )
-
-    args = parser.parse_args()
-
-    # 디버그 모드 설정
-    if args.debug:
-        set_debug_mode(True)
-
-    print("=== Few-shot Semantic Compositing Pipeline ===")
-    print("Step 1:   Load input images")
-    print("Step 1.5: Register camera poses (Gradio UI)")
-    print("Step 1.8: Select best views")
-    print("Step 2:   Generate 360° video with Veo3")
-    print("Step 3:   Segment objects from video")
-    print("Step 4:   Find semantically suitable backgrounds")
-    print("Step 5:   Composite naturally with depth and lighting")
-
-    # Job 선택 및 경로 설정
-    if args.job:
-        # 특정 job 지정
-        job_dir = JOBS_DIR / args.job
-        if not job_dir.exists():
-            print(f"\n[ERROR] Job not found: {job_dir}")
-            return
-        print(f"\n✓ 지정된 job 사용: {args.job}")
-    elif args.new:
-        # 새 job 자동 생성
-        from datetime import datetime
-        JOBS_DIR.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        job_dir = JOBS_DIR / timestamp
-        job_dir.mkdir(parents=True, exist_ok=True)
-        (job_dir / "input").mkdir(exist_ok=True)
-        (job_dir / "output").mkdir(exist_ok=True)
-        (job_dir / "output" / "video").mkdir(exist_ok=True)
-        (job_dir / "output" / "frames").mkdir(exist_ok=True)
-        (job_dir / "output" / "masked_frames").mkdir(exist_ok=True)
-        (job_dir / "output" / "dataset").mkdir(exist_ok=True)
-        print(f"\n✓ 새 job 생성: {timestamp}")
-    else:
-        job_dir = select_job()
-
-    setup_job_paths(job_dir)
-
-    # input 폴더에 이미지가 있는지 확인
-    input_images = list(INPUT_DIR.glob("*.png")) + list(INPUT_DIR.glob("*.jpg"))
-    if not input_images:
-        print(f"\n[ERROR] input 폴더에 이미지가 없습니다: {INPUT_DIR}")
-        print("이미지를 넣은 후 다시 실행해주세요.")
-
-        # 디버그 모드에서는 더미 이미지 생성
-        if args.debug:
-            print("\n[DEBUG] 더미 입력 이미지 생성 중...")
-            for i in range(3):
-                dummy_img = Image.new("RGB", (512, 512), (150 + i * 30, 100 + i * 20, 80 + i * 10))
-                dummy_path = INPUT_DIR / f"dummy_input_{i:02d}.png"
-                dummy_img.save(dummy_path)
-            print(f"  ✓ 더미 이미지 3개 생성됨: {INPUT_DIR}")
-            input_images = list(INPUT_DIR.glob("*.png"))
-        else:
-            return
-
-    print(f"\n✓ {len(input_images)}개의 입력 이미지 발견")
-    print()
-
-    # 전체 파이프라인 실행
-    results = run_full_pipeline(
-        object_category="monkey doll",
-        semantic_locations=["shelf", "bed", "couch", "table", "toy box"],
-        broad_categories=["home", "indoor", "living room", "bedroom", "house interior"],
-        num_views=3,
-        max_backgrounds=5,
-        similarity_threshold=0.8,
-        overlay_scale=0.8,
-        use_depth=True,
-        use_lighting=False,
-        max_workers=5,
-        debug=args.debug
-    )
-
-    if DEBUG_MODE:
-        print("\n" + "=" * 60)
-        print("DEBUG MODE - 파이프라인 흐름 검증 완료")
-        print("실제 실행 시에는 --debug 옵션 없이 실행하세요.")
-        print("=" * 60)
-    elif results:
-        print(f"\nGenerated {len(results)} images")
-    else:
-        print("\nNo images generated. Check the logs above for errors.")
-
-
-if __name__ == "__main__":
-    main()

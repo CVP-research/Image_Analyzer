@@ -225,6 +225,7 @@ runs/
 venv2/
 .vscode/
 Image-Harmonization-Dataset-iHarmony4/
+Depth-Anything-V2/
 debug_output/
 
 # Pipeline jobs data (large files)
@@ -232,3 +233,6 @@ pipeline/jobs/
 
 # Claude Code
 .claude/
+train/
+temp/
+new/
