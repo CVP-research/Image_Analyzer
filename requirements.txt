@@ -8,9 +8,28 @@ timm
 scipy
 ultralytics
 pyyaml
+tqdm
+scikit-image
+
+# Text embeddings
+sentence-transformers
+
+# FastAPI server (for pose_estimator, segment servers)
+fastapi
+uvicorn
+pydantic
+python-multipart
+jinja2
+
+# Google Generative AI (Veo3)
+google-genai
 
 # PyTorch (install separately based on your system)
 # Visit: https://pytorch.org/get-started/locally/
 torch
 torchvision
 matplotlib
+
+# Optional dependencies (uncomment if needed)
+# libcom          # Image harmonization
+# realesrgan      # Image upscaling

@@ -212,8 +212,8 @@ input/
 output/
 
 # Depth Anything V2 checkpoints
-Depth-Anything-V2/checkpoints/*.pth
-Depth-Anything-V2/checkpoints/*.pt
+modules/Depth-Anything-V2/checkpoints/*.pth
+modules/Depth-Anything-V2/checkpoints/*.pt
 
 # Gradio
 .gradio/
@@ -222,11 +222,13 @@ dataset/
 credentials.json
 *.pt
 runs/
-new/data/
-new/dataset/
-new/output/
-new/venv2/
 venv2/
 .vscode/
 Image-Harmonization-Dataset-iHarmony4/
 debug_output/
+
+# Pipeline jobs data (large files)
+pipeline/jobs/
+
+# Claude Code
+.claude/
