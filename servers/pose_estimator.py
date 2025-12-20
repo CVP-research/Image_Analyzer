@@ -154,20 +154,6 @@ async def load_poses():
     return {"poses": poses}
 
 
-@app.get("/api/poses/download")
-async def download_poses():
-    """
-    포즈 JSON 파일 다운로드
-    """
-    if not POSES_FILE.exists():
-        raise HTTPException(status_code=404, detail="No poses saved")
-    return FileResponse(
-        POSES_FILE,
-        filename="camera_poses.json",
-        media_type="application/json"
-    )
-
-
 @app.post("/api/complete")
 async def complete_and_shutdown():
     """

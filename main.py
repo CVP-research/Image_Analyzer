@@ -434,6 +434,7 @@ class Pipeline:
             num_negative_samples=num_negative_samples,
             val_split_ratio=0.2,
             class_id=0,
+            class_name=self.paths.project_name,
             device=0
         )
         
@@ -496,6 +497,34 @@ class Pipeline:
         print(f"   - 생성된 영상:   {self.paths.video_dir}")
         print(f"   - 분리된 객체:   {self.paths.masked_frames_dir}")
         print(f"   - YOLO 데이터셋: {self.paths.yolo_dataset_dir}")
+        
+        return True  # 파이프라인 성공
+
+    # ==========================================
+    # STEP 7: YOLO 파인튜닝 (선택적)
+    # ==========================================
+    def _train_yolo(self, epochs: int = 100, batch: int = 16, imgsz: int = 640):
+        """Step 7: YOLO 모델 파인튜닝"""
+        print("\n" + "=" * 60)
+        print("STEP 7: YOLO 모델 파인튜닝")
+        print("=" * 60)
+        
+        # fine_tuning_yolo.py 호출
+        train_script = self.base_dir / "fine_tuning_yolo.py"
+        if not train_script.exists():
+            print(f"❌ 학습 스크립트를 찾을 수 없습니다: {train_script}")
+            return
+        
+        command = [
+            sys.executable, str(train_script),
+            self.paths.project_name,
+            "--epochs", str(epochs),
+            "--batch", str(batch),
+            "--imgsz", str(imgsz)
+        ]
+        
+        print(f"✓ 학습 시작: {' '.join(command)}")
+        subprocess.run(command, cwd=str(self.base_dir))
 
 
 if __name__ == "__main__":
@@ -507,6 +536,8 @@ if __name__ == "__main__":
     python main.py my_project          # my_project 프로젝트 실행
     python main.py my_project --debug  # 디버그 모드 (API 호출 스킵)
     python main.py my_project --mock   # Veo3 스킵, 기존 영상 사용
+    python main.py my_project --train  # 파이프라인 + YOLO 학습까지
+    python main.py my_project --train --epochs 200 --batch 8
     
 디렉토리 구조:
     data/{project}/input/     <- 여기에 이미지를 넣으세요
@@ -529,7 +560,34 @@ if __name__ == "__main__":
         action="store_true",
         help="Mock 모드: Veo3 API 스킵하고 기존 영상 파일 사용"
     )
+    parser.add_argument(
+        "--train", "-t",
+        action="store_true",
+        help="데이터셋 생성 후 YOLO 파인튜닝까지 실행"
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=100,
+        help="YOLO 학습 에폭 수 (기본: 100, --train 필요)"
+    )
+    parser.add_argument(
+        "--batch",
+        type=int,
+        default=16,
+        help="YOLO 학습 배치 크기 (기본: 16, --train 필요)"
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=640,
+        help="YOLO 학습 이미지 크기 (기본: 640, --train 필요)"
+    )
     args = parser.parse_args()
 
     pipeline = Pipeline(project_name=args.project, debug=args.debug, mock_veo3=args.mock)
-    pipeline.run()
+    success = pipeline.run()
+    
+    # --train 옵션이 있으면 YOLO 학습까지 진행
+    if args.train and success:
+        pipeline._train_yolo(epochs=args.epochs, batch=args.batch, imgsz=args.imgsz)

@@ -286,22 +286,19 @@ window.savePoses = async function(autoComplete = false) {
         const result = await response.json();
         console.log('Save result:', result);
         alert(`${result.saved}개의 포즈가 저장되었습니다!`);
-
-        // 다운로드
-        window.open(`${API_BASE}/api/poses/download`, '_blank');
         
         // 서버 종료 (다음 단계로 진행)
         const shouldComplete = autoComplete || confirm('포즈 저장이 완료되었습니다. 서버를 종료하고 다음 단계로 진행하시겠습니까?');
         if (shouldComplete) {
             document.body.innerHTML = '<h1 style="text-align:center; margin-top:20vh; color:#fff;">✅ 포즈 저장 완료! 서버를 종료합니다...</h1>';
-            // 약간의 딜레이 후 서버 종료 (다운로드 완료 대기)
+            // 서버 종료
             setTimeout(async () => {
                 try {
                     await fetch(`${API_BASE}/api/complete`, { method: 'POST' });
                 } catch (e) {
                     // 서버가 종료되면서 연결이 끊어지므로 에러 무시
                 }
-            }, 1500);
+            }, 500);
         }
     } catch (error) {
         console.error('Save error:', error);

@@ -109,8 +109,8 @@ class JobPaths:
 
     @property
     def yolo_dataset_dir(self) -> Path:
-        """YOLO 학습용 데이터셋 출력 디렉토리"""
-        return self._output_dir / "yolo_dataset"
+        """YOLO 학습용 데이터셋 출력 디렉토리 (프로젝트명으로 생성)"""
+        return self._output_dir / self._project_name
 
     def get_object_source_dirs(self) -> list:
         """
